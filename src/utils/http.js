@@ -172,6 +172,7 @@ export async function downloadBinary(url, options = {}) {
     raw: true,
     timeout: options.timeout ?? 120000,
     silent: options.silent === true,
+    signal: options.signal,
     onDownloadProgress: (event) => {
       if (!options.onProgress) return
       const total = event.total || 0

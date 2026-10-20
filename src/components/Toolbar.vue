@@ -12,15 +12,17 @@ import {
   state,
   store,
   currentFrame,
-  selectedObject,
+  selectedObjects,
   activeClass,
   addObject,
   setTool,
+  copySelected,
+  pasteObjects,
 } from '../stores/useAnnotationStore.js'
 import { viewerRef } from '../three/viewerRef.js'
 import { ACCEPT } from '../three/loaders/index.js'
 import { downloadJson, downloadText, pickFile } from '../utils/io.js'
-import { requestRemoveObject } from '../utils/actions.js'
+import { requestRemoveObjects } from '../utils/actions.js'
 import { buildSavePayload, summarizePayload, saveToServer, isSaveConfigured } from '../utils/save.js'
 import { withLoading } from '../utils/http.js'
 
@@ -59,6 +61,8 @@ const ARROW_TEMPLATES = [
 ]
 
 const isDrawing = computed(() => state.tool === 'line' || state.tool === 'arrow')
+const drawingLabel = computed(() => (state.tool === 'arrow' ? '画箭头' : '画线'))
+const multiActive = computed(() => state.multiFrame || state.multiFrameMove)
 
 /** 标线类别名（用于「添加框」时自动避开） */
 const MARKING_CLASS_NAMES = ['LaneLine', 'Crosswalk', 'RoadArrow', 'StopLine']
@@ -119,6 +123,35 @@ function openFiles() {
   fileInput.value?.click()
 }
 
+/** 数据下拉：示例数据集 / 本地文件 */
+function onDataCommand(command) {
+  if (command === 'local') openFiles()
+  else if (String(command).startsWith('sample:')) loadDataset(String(command).slice(7))
+}
+
+/** “更多”菜单：低频操作收进下拉，减少顶部视觉噪音 */
+function onMoreCommand(command) {
+  switch (command) {
+    case 'groundtruth':
+      importGroundTruth()
+      break
+    case 'kitti':
+      exportKitti()
+      break
+    case 'clear':
+      clearFrame()
+      break
+    case 'import-project':
+      importProject()
+      break
+    case 'export-project':
+      exportProject()
+      break
+    default:
+      break
+  }
+}
+
 /** 本地文件选择回调（支持多选，每个文件一帧） */
 function onFiles(event) {
   const files = Array.from(event.target.files || [])
@@ -162,7 +195,19 @@ function addBox() {
 
 
 function deleteSelected() {
-  requestRemoveObject(selectedObject.value)
+  requestRemoveObjects(selectedObjects.value)
+}
+
+function copySelection() {
+  const n = copySelected()
+  if (n) ElMessage.success(`已复制 ${n} 个对象`)
+  else ElMessage.info('请先选择对象')
+}
+
+function pasteSelection({ inPlace = false } = {}) {
+  const n = pasteObjects({ inPlace })
+  if (n) ElMessage.success(`已粘贴 ${n} 个对象`)
+  else ElMessage.info('剪贴板为空')
 }
 
 /** 导出整个项目标注为 JSON */
@@ -182,8 +227,11 @@ async function save() {
   const filename = `${state.datasetName || 'annotation'}.json`
 
   if (!isSaveConfigured()) {
-    downloadJson(filename, payload)
-    ElMessage.warning('未配置后端保存接口（VITE_SAVE_API），已改为下载 JSON')
+    // 纯静态演示：直接导出紧凑 JSON（含所有帧框/标线 + 已编辑的点标签）
+    downloadText(filename, JSON.stringify(payload), 'application/json')
+    ElMessage.success(
+      `已导出：${info.frames} 帧 / ${info.boxes} 框 / ${info.lines} 线 / ${info.arrows} 箭头 / ${info.labeledFrames} 帧点标签`,
+    )
     return
   }
   await withLoading(saving, async () => {
@@ -220,13 +268,25 @@ function exportKitti() {
   if (skipped) ElMessage.warning(`KITTI 不支持标线，已跳过 ${skipped} 个标线对象`)
 }
 
-/** 导入示例数据集自带的真值 */
+/** 重新导入全量真值（覆盖当前所有帧对象） */
 async function importGroundTruth() {
+  if (!state.groundTruthUrl) return
   try {
-    const count = await store.importGroundTruth()
-    ElMessage.success(`已导入真值 ${count} 个对象`)
+    await ElMessageBox.confirm('将覆盖所有帧当前的标注对象，确定重新导入全量真值？', '重新导入真值', {
+      type: 'warning',
+    })
+  } catch {
+    return
+  }
+  try {
+    store.cancelScheduledGroundTruth()
+    state.gtLoading = true
+    const count = await store.importAllGroundTruth()
+    ElMessage.success(`已重新导入全量真值 ${count.toLocaleString()} 个对象`)
   } catch (err) {
     ElMessage.error(`真值导入失败: ${err.message}`)
+  } finally {
+    state.gtLoading = false
   }
 }
 
@@ -243,46 +303,167 @@ async function clearFrame() {
 
 <template>
   <header class="toolbar">
-    <span class="brand">
-      <el-icon><Aim /></el-icon>
-      点云标注
-    </span>
+    <div class="toolbar-main">
+      <span class="brand">
+        <el-icon><Aim /></el-icon>
+        点云标注
+      </span>
 
-    <el-button-group>
-      <el-dropdown trigger="click" @command="loadDataset">
+      <el-dropdown trigger="click" @command="onDataCommand">
         <el-button>
           <el-icon><Files /></el-icon>
-          <span>示例数据</span>
-          <el-icon><ArrowDown /></el-icon>
+          <span>数据</span>
+          <el-icon class="el-icon--right"><ArrowDown /></el-icon>
         </el-button>
         <template #dropdown>
           <el-dropdown-menu>
-            <el-dropdown-item v-for="d in datasets" :key="d.id" :command="d.id">
+            <el-dropdown-item v-for="d in datasets" :key="d.id" :command="`sample:${d.id}`">
               {{ d.name }} · {{ d.frames }}帧 / {{ (d.pointsPerFrame / 1000).toFixed(0) }}k点
             </el-dropdown-item>
             <el-dropdown-item v-if="!datasets.length" disabled>
               无可用数据集（请先运行 npm run gen:test-data）
             </el-dropdown-item>
+            <el-dropdown-item divided command="local">
+              <el-icon><Upload /></el-icon>
+              加载本地文件…
+            </el-dropdown-item>
           </el-dropdown-menu>
         </template>
       </el-dropdown>
-      <el-button @click="openFiles">
-        <el-icon><Upload /></el-icon>
-        <span>加载文件</span>
+      <input ref="fileInput" class="hidden-input" type="file" multiple :accept="ACCEPT" @change="onFiles" />
+
+      <el-radio-group :model-value="state.tool" size="default" @change="setTool">
+        <el-radio-button v-for="t in TOOLS" :key="t.id" :value="t.id">{{ t.label }}</el-radio-button>
+      </el-radio-group>
+
+      <el-button type="primary" :disabled="!state.frames.length" @click="addBox">
+        <el-icon><Plus /></el-icon>
+        <span>添加框</span>
       </el-button>
-    </el-button-group>
-    <input ref="fileInput" class="hidden-input" type="file" multiple :accept="ACCEPT" @change="onFiles" />
 
-    <el-divider direction="vertical" />
+      <el-button-group class="selection-actions">
+        <el-button
+          :disabled="!selectedObjects.length"
+          title="复制 (Ctrl+C)"
+          aria-label="复制"
+          @click="copySelection"
+        >
+          <el-icon><CopyDocument /></el-icon>
+        </el-button>
+        <el-button
+          :disabled="!state.clipboardCount"
+          title="粘贴 (Ctrl+V)"
+          aria-label="粘贴"
+          @click="pasteSelection()"
+        >
+          <el-icon><DocumentCopy /></el-icon>
+        </el-button>
+        <el-button
+          :disabled="!selectedObjects.length"
+          title="删除 (Delete)"
+          aria-label="删除"
+          @click="deleteSelected"
+        >
+          <el-icon><Delete /></el-icon>
+        </el-button>
+      </el-button-group>
 
-    <el-radio-group :model-value="state.tool" size="default" @change="setTool">
-      <el-radio-button v-for="t in TOOLS" :key="t.id" :value="t.id">{{ t.label }}</el-radio-button>
-    </el-radio-group>
+      <el-popover placement="bottom-start" :width="300" trigger="click">
+        <template #reference>
+          <el-button :type="multiActive ? 'primary' : ''" :plain="multiActive">
+            <el-icon><Connection /></el-icon>
+            <span>多帧</span>
+          </el-button>
+        </template>
+        <div class="popover-panel">
+          <div class="popover-toggle">
+            <div>
+              <div class="popover-title">多帧添加</div>
+              <div class="hint">从此帧起，新物体同步到之后所有帧</div>
+            </div>
+            <el-switch v-model="state.multiFrame" size="small" />
+          </div>
+          <div class="popover-toggle">
+            <div>
+              <div class="popover-title">多帧移动</div>
+              <div class="hint">移动/旋转/缩放时同步后续帧同一 track</div>
+            </div>
+            <el-switch v-model="state.multiFrameMove" size="small" />
+          </div>
+        </div>
+      </el-popover>
 
-    <el-divider direction="vertical" />
+      <div class="spacer"></div>
 
-    <!-- 标线绘制选项 -->
-    <template v-if="isDrawing">
+      <el-popover placement="bottom-end" :width="260" trigger="click">
+        <template #reference>
+          <el-button>
+            <el-icon><Setting /></el-icon>
+            <span>显示</span>
+          </el-button>
+        </template>
+        <div class="popover-panel">
+          <div class="popover-field">
+            <span class="popover-label">着色模式</span>
+            <el-select v-model="state.colorMode" style="width: 100%">
+              <el-option label="强度" value="intensity" />
+              <el-option label="高度" value="height" />
+              <el-option label="原始颜色" value="source" />
+              <el-option label="语义标签" value="label" />
+            </el-select>
+          </div>
+          <div class="popover-field">
+            <span class="popover-label">点大小</span>
+            <el-slider
+              v-model="state.pointSize"
+              :min="0.5"
+              :max="6"
+              :step="0.25"
+              :show-tooltip="false"
+            />
+          </div>
+        </div>
+      </el-popover>
+
+      <el-dropdown trigger="click" @command="onMoreCommand">
+        <el-button>
+          <el-icon><MoreFilled /></el-icon>
+          <span>更多</span>
+        </el-button>
+        <template #dropdown>
+          <el-dropdown-menu>
+            <el-dropdown-item command="groundtruth" :disabled="!state.groundTruthUrl">
+              重新导入真值
+            </el-dropdown-item>
+            <el-dropdown-item command="kitti" :disabled="!state.frames.length">
+              导出 KITTI
+            </el-dropdown-item>
+            <el-dropdown-item command="clear" :disabled="!state.frames.length">
+              清空本帧
+            </el-dropdown-item>
+            <el-dropdown-item divided command="import-project">导入标注</el-dropdown-item>
+            <el-dropdown-item command="export-project" :disabled="!state.frames.length">
+              导出标注（项目 JSON）
+            </el-dropdown-item>
+          </el-dropdown-menu>
+        </template>
+      </el-dropdown>
+
+      <el-tooltip placement="bottom" content="导出所有帧的框/标线与已编辑的点级标签为 JSON">
+        <el-button type="primary" :loading="saving" :disabled="!state.frames.length" @click="save">
+          <el-icon><Download /></el-icon>
+          <span>导出数据</span>
+        </el-button>
+      </el-tooltip>
+    </div>
+
+    <!-- 绘制时出现的第二行上下文工具栏，避免主栏频繁跳动 -->
+    <div v-if="isDrawing" class="toolbar-context">
+      <span class="context-title">
+        <el-icon><EditPen /></el-icon>
+        {{ drawingLabel }}
+      </span>
+
       <div class="inline">
         <span>线宽</span>
         <el-input-number
@@ -295,6 +476,7 @@ async function clearFrame() {
           style="width: 72px"
         />
       </div>
+
       <template v-if="state.tool === 'arrow'">
         <div class="inline">
           <span>模板</span>
@@ -316,85 +498,26 @@ async function clearFrame() {
           <span>°</span>
         </div>
       </template>
-      <el-button size="small" :disabled="!state.draftCount" @click="viewerRef.current?.undoDrawPoint()">
-        退点
-      </el-button>
-      <el-button size="small" type="primary" plain :disabled="!state.draftCount" @click="finishDraw">
-        完成
-      </el-button>
-      <el-button size="small" @click="cancelDraw">取消</el-button>
-      <el-tooltip placement="bottom" :content="drawHint">
-        <span class="hint" style="cursor: help">绘制说明 ⓘ</span>
+
+      <el-button-group>
+        <el-button size="small" :disabled="!state.draftCount" @click="viewerRef.current?.undoDrawPoint()">
+          退点
+        </el-button>
+        <el-button size="small" type="primary" plain :disabled="!state.draftCount" @click="finishDraw">
+          完成
+        </el-button>
+        <el-button size="small" @click="cancelDraw">取消</el-button>
+      </el-button-group>
+
+      <span class="inline">
+        <el-switch v-model="state.snapToPoints" size="small" />
+        <span>吸附点云</span>
+      </span>
+
+      <span class="spacer"></span>
+      <el-tooltip placement="bottom-end" :content="drawHint">
+        <span class="hint context-help">绘制说明 ⓘ</span>
       </el-tooltip>
-      <el-divider direction="vertical" />
-    </template>
-
-    <el-button type="primary" :disabled="!state.frames.length" @click="addBox">
-      <el-icon><Plus /></el-icon>
-      <span>添加框</span>
-    </el-button>
-    <el-tooltip
-      placement="bottom"
-      content="开启后，在此帧添加的物体（含标线）会自动添加到之后所有帧；此帧之前不显示"
-    >
-      <span class="inline">
-        <el-switch v-model="state.multiFrame" size="small" />
-        <span>多帧添加</span>
-      </span>
-    </el-tooltip>
-    <el-tooltip
-      placement="bottom"
-      content="开启后，移动/旋转/缩放当前帧的物体时，之后所有帧中同一 track 的物体会同步偏移（保持相对运动）"
-    >
-      <span class="inline">
-        <el-switch v-model="state.multiFrameMove" size="small" />
-        <span>多帧移动</span>
-      </span>
-    </el-tooltip>
-    <el-button :disabled="!selectedObject" @click="deleteSelected">删除</el-button>
-
-    <el-divider direction="vertical" />
-
-    <div class="inline">
-      <span>着色</span>
-      <el-select v-model="state.colorMode" style="width: 110px">
-        <el-option label="强度" value="intensity" />
-        <el-option label="高度" value="height" />
-        <el-option label="原始颜色" value="source" />
-        <el-option label="语义标签" value="label" />
-      </el-select>
     </div>
-
-    <div class="inline">
-      <span>点大小</span>
-      <el-slider
-        v-model="state.pointSize"
-        class="point-size"
-        :min="0.5"
-        :max="6"
-        :step="0.25"
-        :show-tooltip="false"
-      />
-    </div>
-
-    <div class="spacer"></div>
-
-    <el-button-group>
-      <el-button :disabled="!state.frames.length" @click="importGroundTruth">导入真值</el-button>
-      <el-button :disabled="!state.frames.length" @click="exportKitti">导出 KITTI</el-button>
-      <el-button :disabled="!state.frames.length" @click="clearFrame">清空本帧</el-button>
-    </el-button-group>
-
-    <el-button-group>
-      <el-button @click="importProject">导入标注</el-button>
-      <el-button type="primary" plain :disabled="!state.frames.length" @click="exportProject">导出标注</el-button>
-    </el-button-group>
-
-    <el-tooltip placement="bottom" content="保存到后端接口（VITE_SAVE_API）；未配置时改为下载 JSON">
-      <el-button type="primary" :loading="saving" :disabled="!state.frames.length" @click="save">
-        <el-icon><UploadFilled /></el-icon>
-        <span>保存</span>
-      </el-button>
-    </el-tooltip>
   </header>
 </template>

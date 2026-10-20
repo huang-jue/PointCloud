@@ -62,6 +62,9 @@ export const MARKING_CLASS = { line: 'LaneLine', arrow: 'RoadArrow' }
 
 let classSeq = 100 // 新增类别自增 id
 let trackSeq = 1000 // 多帧物体 trackId 自增（避开真值里的小整数）
+let clipboard = [] // 内部复制粘贴剪贴板（普通对象，不进入响应式）
+let pasteSerial = 0 // 连续粘贴的偏移序号
+let groundTruthToken = 0 // 延迟导入全量真值的代次，切换数据集时丢弃旧任务
 
 function nextTrackId() {
   return ++trackSeq
@@ -77,6 +80,7 @@ export const state = reactive({
   /* 帧与当前索引 */
   frames: [],
   currentIndex: -1,
+  groundTruthUrl: null, // 全量真值文件地址（scene.groundTruth）
 
   /* 类别 */
   classes: DEFAULT_CLASSES.map((c) => ({ ...c })),
@@ -97,9 +101,13 @@ export const state = reactive({
   arrowTemplate: 'free', // free | straight | left | right | straightLeft | uturn
   drawHeading: 0, // 模板箭头朝向（度）
   draftCount: 0, // 当前绘制草稿的顶点数
+  snapToPoints: true, // 拖拽标线顶点时是否吸附到最近的点云
   lastBoxClassId: 0, // 进入绘制前使用的框类别，退出时恢复
 
-  selectedObjectId: null,
+  selectedObjectId: null, // 单选主对象（兼容原有属性面板/手柄逻辑）
+  selectedObjectIds: [], // 多选集合（当前帧对象 id）
+  clipboardCount: 0, // 内部剪贴板对象数
+  gtLoading: false, // 正在加载全量真值
 
   /* 点级分割 */
   segEnabled: false,
@@ -112,7 +120,8 @@ export const state = reactive({
   labelVersion: 0, // 标签数据版本号，用于触发面板刷新
 
   /* 加载/错误（error 由 App 监听后弹 message） */
-  loading: false,
+  loading: false, // 点云加载中（逻辑状态）
+  loadingVisible: false, // 超过 150ms 才显示的 loading 遮罩
   error: '',
 })
 
@@ -125,10 +134,19 @@ export const currentObjects = computed(() => {
   return f ? f.objects : []
 })
 
-/** 当前选中的标注对象 */
+/** 当前选中的全部对象（保持当前帧对象顺序） */
+export const selectedObjects = computed(() => {
+  const ids = state.selectedObjectIds
+  if (!ids.length) return []
+  const set = new Set(ids)
+  return currentObjects.value.filter((o) => set.has(o.id))
+})
+
+/** 单选对象：只有恰好选中一个时返回，属性面板/单对象手柄使用 */
 export const selectedObject = computed(() => {
-  if (!state.selectedObjectId) return null
-  return currentObjects.value.find((o) => o.id === state.selectedObjectId) || null
+  if (state.selectedObjectIds.length !== 1) return null
+  const id = state.selectedObjectIds[0]
+  return currentObjects.value.find((o) => o.id === id) || null
 })
 
 /** 当前激活类别（新建框时使用） */
@@ -181,7 +199,19 @@ export function reset() {
   state.datasetName = ''
   state.frames = []
   state.currentIndex = -1
+  state.groundTruthUrl = null
   state.selectedObjectId = null
+  state.selectedObjectIds = []
+  state.selectedSegment = null
+  state.lastLabel = null
+  state.selectionCount = 0
+  state.gtLoading = false
+  state.loading = false
+  state.loadingVisible = false
+  groundTruthToken++
+  clipboard = []
+  pasteSerial = 0
+  state.clipboardCount = 0
   state.error = ''
 }
 
@@ -196,10 +226,17 @@ export function setScene(scene, baseUrl) {
   state.coordinate = scene.coordinate || state.coordinate
   state.sensorHeight = scene.sensor?.height ?? state.sensorHeight
   state.camera = scene.camera || null
+  state.groundTruthUrl = scene.groundTruth ? joinUrl(baseUrl, scene.groundTruth) : null
   if (Array.isArray(scene.classes) && scene.classes.length) {
     state.classes = scene.classes.map((c) => ({ ...c }))
     classSeq = Math.max(100, ...state.classes.map((c) => c.id)) + 1
   }
+  // 类别表可能整体替换，必须把当前类别校正到实际存在的 id
+  const firstClassId = state.classes[0]?.id ?? 0
+  if (!state.classes.some((c) => c.id === state.activeClassId)) state.activeClassId = firstClassId
+  if (!state.classes.some((c) => c.id === state.lastBoxClassId)) state.lastBoxClassId = firstClassId
+  state.selectedObjectId = null
+  state.selectedObjectIds = []
   // 每帧优先使用 bin，其次 pcd/ply；三个字段任一存在即可
   state.frames = (scene.frames || []).map((f, i) => {
     const file = f.bin || f.pcd || f.ply
@@ -245,7 +282,38 @@ export async function loadSampleDataset(id) {
     throw new Error(`示例数据集「${id}」不可用：${err.message}`)
   }
   setScene(scene, `${SAMPLE_BASE}/${id}`)
+  // 延迟导入全量真值：先让第一帧点云独占网络/主线程，避免首屏被 7k+ 对象导入拖慢
+  scheduleGroundTruthImport()
   return scene
+}
+
+/** 取消尚未执行的延迟真值导入（手动重新导入时调用） */
+export function cancelScheduledGroundTruth() {
+  groundTruthToken++
+}
+
+/** 延迟导入全量真值（仅当数据集提供 groundTruth 文件） */
+export function scheduleGroundTruthImport(delay = 600) {
+  const url = state.groundTruthUrl
+  if (!url) return
+  const token = ++groundTruthToken
+  setTimeout(() => {
+    if (token !== groundTruthToken || state.groundTruthUrl !== url) return
+    // 用户在延迟期间已经开始手工标注时，不要覆盖
+    const hasManual = state.frames.some((f) =>
+      f.objects.some((o) => o.source === 'manual' || o.source === 'copy'),
+    )
+    if (hasManual) return
+    state.gtLoading = true
+    importAllGroundTruth()
+      .catch((err) => {
+        if (token !== groundTruthToken) return
+        state.error = `全量真值加载失败: ${err?.message || String(err)}`
+      })
+      .finally(() => {
+        if (token === groundTruthToken) state.gtLoading = false
+      })
+  }, delay)
 }
 
 /** 加载第一个示例数据集 */
@@ -294,6 +362,7 @@ export function setCurrentIndex(i) {
   if (i < 0 || i >= state.frames.length) return
   state.currentIndex = i
   state.selectedObjectId = null
+  state.selectedObjectIds = []
   state.selectedSegment = null
   state.lastLabel = null
 }
@@ -348,7 +417,8 @@ export function addObject(partial, options = {}) {
     state.frames[j].objects.push(obj)
     if (!first) first = obj
   }
-  state.selectedObjectId = first ? first.id : null
+  state.selectedObjectIds = first ? [first.id] : []
+  syncSelectedObjectId()
   return first
 }
 
@@ -367,7 +437,8 @@ export function addPolyline(partial, options = {}) {
   if (!frame) return null
   const shape = partial.shape === 'arrow' ? 'arrow' : 'line'
   const clsName = partial.type || MARKING_CLASS[shape]
-  const cls = partial.classId != null ? classById(partial.classId) : classByName(clsName)
+  let cls = partial.classId != null ? classById(partial.classId) : classByName(clsName)
+  if (!cls && partial.classId == null) cls = classById(ensureClass(clsName))
   const propagate = options.propagate ?? state.multiFrame
   const trackId = propagate ? nextTrackId() : (partial.trackId ?? 0)
   const startFrame = propagate ? state.currentIndex : (partial.startFrame ?? state.currentIndex)
@@ -395,7 +466,8 @@ export function addPolyline(partial, options = {}) {
     state.frames[j].objects.push(item)
     if (!first) first = item
   }
-  state.selectedObjectId = first ? first.id : null
+  state.selectedObjectIds = first ? [first.id] : []
+  syncSelectedObjectId()
   return first
 }
 
@@ -471,7 +543,7 @@ export function markingCentroid(obj) {
 
 /** 标线变更同步到后续帧同一 track（多帧移动开启时） */
 function propagateMarkingChange(obj, { points, paths }) {
-  if (!state.multiFrameMove || !(obj.trackId > 0)) return
+  if (!state.multiFrameMove || !obj.multiFrame || !(obj.trackId > 0)) return
   for (let j = state.currentIndex + 1; j < state.frames.length; j++) {
     for (const o of state.frames[j].objects) {
       if (o.trackId !== obj.trackId || !isMarking(o)) continue
@@ -523,7 +595,12 @@ export function updateObject(id, patch) {
   if (isMarking(obj)) {
     // 标线的几何由顶点描述，走 setPolylinePoint 等专用接口；
     // 这里只同步类别/线宽等标量字段
-    if (state.multiFrameMove && obj.trackId > 0) {
+    if (patch.width !== undefined) {
+      // 记住最近一次使用的线宽：下次画同类标线时沿用（在属性面板改宽也会同步到工具栏）
+      if (obj.shape === 'arrow') state.arrowWidth = obj.width
+      else state.lineWidth = obj.width
+    }
+    if (state.multiFrameMove && obj.multiFrame && obj.trackId > 0) {
       for (let j = state.currentIndex + 1; j < state.frames.length; j++) {
         for (const o of state.frames[j].objects) {
           if (o.trackId !== obj.trackId || !isMarking(o)) continue
@@ -536,7 +613,7 @@ export function updateObject(id, patch) {
     return
   }
 
-  if (state.multiFrameMove && obj.trackId > 0) {
+  if (state.multiFrameMove && obj.multiFrame && obj.trackId > 0) {
     propagateDeltaToTrack(obj, patch, before)
   }
 }
@@ -585,7 +662,8 @@ export function removeObject(id, options = {}) {
     const idx = frame.objects.findIndex((o) => o.id === id)
     if (idx !== -1) frame.objects.splice(idx, 1)
   }
-  if (state.selectedObjectId === id) state.selectedObjectId = null
+  state.selectedObjectIds = state.selectedObjectIds.filter((x) => x !== id)
+  syncSelectedObjectId()
 }
 
 /** 统计某 trackId 出现在多少帧中 */
@@ -644,12 +722,152 @@ export function syncTrackForward(id) {
 export function clearObjects() {
   const frame = currentFrame.value
   if (frame) frame.objects.splice(0, frame.objects.length)
+  state.selectedObjectIds = []
   state.selectedObjectId = null
 }
 
-/** 选中/取消选中（传空即取消） */
-export function selectObject(id) {
-  state.selectedObjectId = id || null
+/** 同步单选主 id（供原有单对象逻辑使用） */
+function syncSelectedObjectId() {
+  const ids = state.selectedObjectIds
+  state.selectedObjectId = ids.length === 1 ? ids[0] : null
+}
+
+/** 直接设置选中集合 */
+export function selectObjects(ids) {
+  const valid = new Set(currentObjects.value.map((o) => o.id))
+  state.selectedObjectIds = Array.from(new Set(ids || [])).filter((id) => valid.has(id))
+  syncSelectedObjectId()
+}
+
+/**
+ * 选中/取消选中
+ * @param {string|null} id
+ * @param {{additive?:boolean}} [options] additive=true 时切换该对象（Ctrl/Cmd 点击）
+ */
+export function selectObject(id, options = {}) {
+  const additive = !!options.additive
+  if (!id) {
+    if (!additive) clearSelection()
+    return
+  }
+  if (!additive) {
+    state.selectedObjectIds = [id]
+    syncSelectedObjectId()
+    return
+  }
+  const set = new Set(state.selectedObjectIds)
+  if (set.has(id)) set.delete(id)
+  else set.add(id)
+  state.selectedObjectIds = Array.from(set)
+  syncSelectedObjectId()
+}
+
+/** 清空选择 */
+export function clearSelection() {
+  if (!state.selectedObjectIds.length && state.selectedObjectId === null) return
+  state.selectedObjectIds = []
+  state.selectedObjectId = null
+}
+
+/* ---------------- 复制 / 粘贴 ---------------- */
+
+/** 复制当前选中的对象到内部剪贴板 */
+export function copySelected() {
+  const objects = selectedObjects.value
+  if (!objects.length) return 0
+  clipboard = objects.map(cloneObject)
+  pasteSerial = 0
+  state.clipboardCount = clipboard.length
+  return clipboard.length
+}
+
+/** 把对象类别 id 重新映射到当前数据集 */
+function resolvePastedClassId(obj) {
+  if (classById(obj.classId)) return obj.classId
+  const byName = classByName(obj.type)
+  if (byName) return byName.id
+  return ensureClass(obj.type || 'Object')
+}
+
+/**
+ * 粘贴剪贴板对象到当前帧
+ * @param {{inPlace?:boolean}} [options] inPlace=true 时不偏移
+ * @returns {number} 粘贴的对象数
+ */
+export function pasteObjects({ inPlace = false } = {}) {
+  const frame = currentFrame.value
+  if (!frame || !clipboard.length) return 0
+  const offset = inPlace ? 0 : ++pasteSerial
+  const created = []
+  for (const src of clipboard) {
+    const item = cloneObject(src)
+    item.id = uid(isMarking(item) ? 'mark' : 'obj')
+    item.classId = resolvePastedClassId(item)
+    item.type = classById(item.classId)?.name || item.type
+    item.trackId = 0
+    item.multiFrame = false
+    item.startFrame = state.currentIndex
+    item.source = 'copy'
+    if (item.shape === 'line') {
+      item.points = (item.points || []).map(([x, y, z]) => [x + offset, y, z || 0])
+    } else if (item.shape === 'arrow') {
+      item.paths = (item.paths || []).map((p) =>
+        p.map(([x, y, z]) => [x + offset, y, z || 0]),
+      )
+    } else {
+      item.x = (item.x ?? 0) + offset
+    }
+    frame.objects.push(item)
+    created.push(item)
+  }
+  state.selectedObjectIds = created.map((o) => o.id)
+  syncSelectedObjectId()
+  return created.length
+}
+
+/** 原地复制选中对象（不改变剪贴板内容） */
+export function duplicateSelected() {
+  const objects = selectedObjects.value
+  if (!objects.length) return 0
+  const previous = clipboard
+  const previousSerial = pasteSerial
+  clipboard = objects.map(cloneObject)
+  pasteSerial = 0
+  const count = pasteObjects({ inPlace: true })
+  clipboard = previous
+  pasteSerial = previousSerial
+  state.clipboardCount = clipboard.length
+  return count
+}
+
+/**
+ * 批量平移当前帧选中对象（多选整体平移提交时调用）
+ * @param {string[]} ids
+ * @param {{dx?:number,dy?:number,dz?:number}} delta
+ */
+export function translateObjects(ids, { dx = 0, dy = 0, dz = 0 } = {}) {
+  if (!dx && !dy && !dz) return 0
+  const wanted = new Set(ids || [])
+  const objects = currentObjects.value.filter((o) => wanted.has(o.id))
+  for (const obj of objects) {
+    if (isMarking(obj)) {
+      if (obj.shape === 'line') {
+        obj.points = (obj.points || []).map(([x, y, z]) => [x + dx, y + dy, (z || 0) + dz])
+      } else {
+        obj.paths = (obj.paths || []).map((p) =>
+          p.map(([x, y, z]) => [x + dx, y + dy, (z || 0) + dz]),
+        )
+      }
+      propagateMarkingChange(obj, { points: obj.points, paths: obj.paths })
+    } else {
+      updateObject(obj.id, {
+        x: (obj.x ?? 0) + dx,
+        y: (obj.y ?? 0) + dy,
+        z: (obj.z ?? 0) + dz,
+      })
+    }
+  }
+  return objects.length
 }
 
 /* ---------------- 类别 ---------------- */
@@ -661,10 +879,17 @@ export function addClass(name, color) {
   return id
 }
 
-/** 更新类别名称/颜色 */
+/** 更新类别名称/颜色（改名时同步所有对象的 type） */
 export function updateClass(id, patch) {
   const c = classById(id)
-  if (c) Object.assign(c, patch)
+  if (!c) return
+  Object.assign(c, patch)
+  if (patch.name !== undefined) {
+    const name = c.name
+    state.frames.forEach((f) => f.objects.forEach((o) => {
+      if (o.classId === id) o.type = name
+    }))
+  }
 }
 
 /** 删除类别，并把引用该类别对象回退到第一个类别 */
@@ -672,11 +897,17 @@ export function removeClass(id) {
   const idx = state.classes.findIndex((c) => c.id === id)
   if (idx === -1) return
   state.classes.splice(idx, 1)
+  const fallback = state.classes[0] || { id: 0, name: 'Object' }
   state.frames.forEach((f) =>
     f.objects.forEach((o) => {
-      if (o.classId === id) o.classId = state.classes[0]?.id ?? 0
+      if (o.classId === id) {
+        o.classId = fallback.id
+        o.type = fallback.name
+      }
     }),
   )
+  if (state.activeClassId === id) state.activeClassId = fallback.id
+  if (state.lastBoxClassId === id) state.lastBoxClassId = fallback.id
 }
 
 /* ---------------- 导入 / 导出 ---------------- */
@@ -720,6 +951,9 @@ export function applyProject(data, { merge = true } = {}) {
   if (data.classes) {
     state.classes = data.classes.map((c) => ({ ...c }))
     classSeq = Math.max(100, ...state.classes.map((c) => c.id)) + 1
+    const firstClassId = state.classes[0]?.id ?? 0
+    if (!state.classes.some((c) => c.id === state.activeClassId)) state.activeClassId = firstClassId
+    if (!state.classes.some((c) => c.id === state.lastBoxClassId)) state.lastBoxClassId = firstClassId
   }
   const byName = new Map(data.frames.map((f) => [f.name, f]))
   const positional = data.frames.length === state.frames.length
@@ -768,6 +1002,26 @@ export function applyProject(data, { merge = true } = {}) {
     if (merge) frame.objects.push(...objects)
     else frame.objects = objects
   })
+  // 导入真实数据集时 trackId 可能大于 1000，必须同步自增序号避免新物体撞号
+  let maxTrack = 0
+  state.frames.forEach((f) => f.objects.forEach((o) => {
+    if (o.trackId > maxTrack) maxTrack = o.trackId
+  }))
+  trackSeq = Math.max(trackSeq, maxTrack)
+  state.selectedObjectIds = []
+  state.selectedObjectId = null
+}
+
+/**
+ * 导入当前数据集的全量真值（scene.groundTruth）
+ * @returns {Promise<number>} 导入的对象总数
+ */
+export async function importAllGroundTruth() {
+  if (!state.groundTruthUrl) throw new Error('当前数据集没有全量真值文件')
+  const data = await get(state.groundTruthUrl, null, { silent: true })
+  if (!data || !Array.isArray(data.frames)) throw new Error('全量真值格式无效')
+  applyProject({ frames: data.frames }, { merge: false })
+  return data.frames.reduce((n, f) => n + (f.objects?.length || 0), 0)
 }
 
 /** 导出当前帧为 KITTI 文本（每行一个对象；标线无法用 KITTI 表示，会被跳过） */
@@ -811,6 +1065,7 @@ export const store = {
   currentFrame,
   currentObjects,
   selectedObject,
+  selectedObjects,
   activeClass,
   reset,
   setScene,
@@ -836,6 +1091,12 @@ export const store = {
   countTrackFrames,
   clearObjects,
   selectObject,
+  selectObjects,
+  clearSelection,
+  copySelected,
+  pasteObjects,
+  duplicateSelected,
+  translateObjects,
   addClass,
   updateClass,
   removeClass,
@@ -849,6 +1110,9 @@ export const store = {
   countNonKittiObjects,
   importKittiText,
   importGroundTruth,
+  importAllGroundTruth,
+  scheduleGroundTruthImport,
+  cancelScheduledGroundTruth,
   DEFAULT_CLASSES,
   MARKING_CLASS,
 }

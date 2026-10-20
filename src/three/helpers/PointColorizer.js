@@ -44,16 +44,27 @@ function extent(values) {
   return [min, max]
 }
 
+/** 预计算色带 LUT，避免每个点分配临时数组（40 万点下差异非常明显） */
+const LUT_SIZE = 256
+const RAMP_LUT = new Float32Array(LUT_SIZE * 3)
+for (let i = 0; i < LUT_SIZE; i++) {
+  const [r, g, b] = sampleRamp(i / (LUT_SIZE - 1))
+  RAMP_LUT[i * 3] = r
+  RAMP_LUT[i * 3 + 1] = g
+  RAMP_LUT[i * 3 + 2] = b
+}
+
 /** 按强度归一化到色带 */
 export function intensityToColor(intensity) {
   const [min, max] = extent(intensity)
   const span = max - min || 1
   const out = new Float32Array(intensity.length * 3)
   for (let i = 0; i < intensity.length; i++) {
-    const [r, g, b] = sampleRamp((intensity[i] - min) / span)
-    out[i * 3] = r
-    out[i * 3 + 1] = g
-    out[i * 3 + 2] = b
+    const t = (intensity[i] - min) / span
+    const li = (t <= 0 ? 0 : t >= 1 ? LUT_SIZE - 1 : (t * (LUT_SIZE - 1)) | 0) * 3
+    out[i * 3] = RAMP_LUT[li]
+    out[i * 3 + 1] = RAMP_LUT[li + 1]
+    out[i * 3 + 2] = RAMP_LUT[li + 2]
   }
   return out
 }
@@ -71,10 +82,11 @@ export function heightToColor(positions) {
   const span = max - min || 1
   const out = new Float32Array(n * 3)
   for (let i = 0; i < n; i++) {
-    const [r, g, b] = sampleRamp((positions[i * 3 + 2] - min) / span)
-    out[i * 3] = r
-    out[i * 3 + 1] = g
-    out[i * 3 + 2] = b
+    const t = (positions[i * 3 + 2] - min) / span
+    const li = (t <= 0 ? 0 : t >= 1 ? LUT_SIZE - 1 : (t * (LUT_SIZE - 1)) | 0) * 3
+    out[i * 3] = RAMP_LUT[li]
+    out[i * 3 + 1] = RAMP_LUT[li + 1]
+    out[i * 3 + 2] = RAMP_LUT[li + 2]
   }
   return out
 }

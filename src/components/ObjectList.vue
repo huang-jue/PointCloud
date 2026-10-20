@@ -3,19 +3,60 @@
  * ObjectList —— 左侧当前帧标注对象列表
  * 单击选中、双击把视口焦点移到该对象、右侧按钮删除（多帧物体走确认流程）
  */
+import { watch } from 'vue'
 import {
   state,
   currentObjects,
   currentFrame,
   classColor,
   selectObject,
+  selectObjects,
+  clearSelection,
 } from '../stores/useAnnotationStore.js'
 import { viewerRef } from '../three/viewerRef.js'
 import { requestRemoveObject } from '../utils/actions.js'
 import { polylineLength } from '../utils/polyline.js'
 
+let anchorId = null
+
+/** 对象列表点击：普通单选、Ctrl 切换、Shift 范围选择 */
+function onItemClick(obj, event) {
+  if (event.shiftKey && anchorId) {
+    const ids = currentObjects.value.map((o) => o.id)
+    const a = ids.indexOf(anchorId)
+    const b = ids.indexOf(obj.id)
+    if (a >= 0 && b >= 0) {
+      const [lo, hi] = a < b ? [a, b] : [b, a]
+      selectObjects(ids.slice(lo, hi + 1))
+      return
+    }
+  }
+  if (event.ctrlKey || event.metaKey) {
+    selectObject(obj.id, { additive: true })
+  } else {
+    selectObject(obj.id)
+  }
+  anchorId = obj.id
+}
+
+function selectAll() {
+  selectObjects(currentObjects.value.map((o) => o.id))
+}
+
+function isSelected(id) {
+  return state.selectedObjectIds.includes(id)
+}
+
+watch(
+  () => [state.datasetName, state.currentIndex],
+  () => {
+    anchorId = null
+  },
+)
+
 /** 双击让视口聚焦到该对象 */
 function focusObject(obj) {
+  selectObject(obj.id)
   viewerRef.current?.focusObject(obj)
 }
 
@@ -59,6 +100,18 @@ function remove(obj) {
         </span>
       </h3>
       <div class="hint" v-if="currentFrame">{{ currentFrame.name }}</div>
+      <div v-if="currentObjects.length" class="row" style="margin-top: 8px; gap: 8px">
+        <span class="hint">已选 {{ state.selectedObjectIds.length }}</span>
+        <el-button link size="small" @click="selectAll">全选</el-button>
+        <el-button
+          link
+          size="small"
+          :disabled="!state.selectedObjectIds.length"
+          @click="clearSelection"
+        >
+          取消选择
+        </el-button>
+      </div>
     </div>
     <el-scrollbar class="panel-scroll">
       <el-empty
@@ -72,8 +125,8 @@ function remove(obj) {
           v-for="obj in currentObjects"
           :key="obj.id"
           class="obj-item"
-          :class="{ selected: obj.id === state.selectedObjectId }"
-          @click="selectObject(obj.id)"
+          :class="{ selected: isSelected(obj.id) }"
+          @click="onItemClick(obj, $event)"
           @dblclick="focusObject(obj)"
         >
           <span class="obj-dot" :style="{ background: classColor(obj.classId) }"></span>

@@ -26,12 +26,15 @@ export const SUPPORTED_EXT = ['pcd', 'ply', 'bin', 'las', 'laz', 'xyz', 'csv', '
 export const ACCEPT = SUPPORTED_EXT.map((e) => `.${e}`).join(',')
 
 /** 读取数据源为 ArrayBuffer（本地文件或 URL），并对错误做友好提示 */
-async function readSource(source) {
+async function readSource(source, options = {}) {
   if (source.kind === 'file') {
     return source.file.arrayBuffer()
   }
   // 走统一 HTTP 封装：得到 ArrayBuffer 与响应头
-  const { data, contentType } = await downloadBinary(source.url, { silent: true })
+  const { data, contentType } = await downloadBinary(source.url, {
+    silent: true,
+    signal: options.signal,
+  })
   // dev server / SPA 对未知路径会回退到 index.html，这里显式识别
   if (contentType.includes('text/html')) throw new Error(`文件不存在或不是点云: ${source.url}`)
   return data
@@ -42,15 +45,16 @@ async function readSource(source) {
  * @param {{kind:'url'|'file', url?:string, file?:File, ext:string}} source
  * @returns {Promise<{positions:Float32Array,colors:Float32Array|null,intensity:Float32Array|null,pointCount:number}>}
  */
-export async function loadPointCloud(source) {
+export async function loadPointCloud(source, options = {}) {
   const ext = source.ext
-  const buffer = await readSource(source)
+  const buffer = await readSource(source, options)
   switch (ext) {
     case 'pcd':
       return parsePCD(buffer)
     case 'ply':
       return parsePLY(buffer)
     case 'bin':
+      // 38 万点主线程解析仅约 8ms；每帧新建 Worker 的启动开销反而更大，且可能挂起
       return parseKittiBin(buffer)
     case 'las':
     case 'laz':

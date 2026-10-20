@@ -15,9 +15,19 @@ import SegmentPanel from './components/SegmentPanel.vue'
 import Viewer from './components/Viewer.vue'
 import Timeline from './components/Timeline.vue'
 import StatusBar from './components/StatusBar.vue'
-import { state, store, selectedObject, setTool } from './stores/useAnnotationStore.js'
+import {
+  state,
+  store,
+  selectedObjects,
+  setTool,
+  copySelected,
+  pasteObjects,
+  duplicateSelected,
+  selectObjects,
+  clearSelection,
+} from './stores/useAnnotationStore.js'
 import { viewerRef } from './three/viewerRef.js'
-import { requestRemoveObject } from './utils/actions.js'
+import { requestRemoveObjects } from './utils/actions.js'
 
 /** 任意组件把错误写进 state.error，这里统一弹出并复位 */
 watch(
@@ -40,6 +50,21 @@ function isDrawing() {
   return state.tool === 'line' || state.tool === 'arrow'
 }
 
+/** 有手工标注/复制对象或编辑过点标签时，离开页面前提醒（演示环境不自动持久化） */
+function hasUnsavedWork() {
+  const manualObject = state.frames.some((f) =>
+    f.objects.some((o) => o.source === 'manual' || o.source === 'copy'),
+  )
+  const editedLabels = (viewerRef.current?.labelsByKey?.size || 0) > 0
+  return manualObject || editedLabels
+}
+
+function onBeforeUnload(event) {
+  if (!hasUnsavedWork()) return
+  event.preventDefault()
+  event.returnValue = ''
+}
+
 function onKeydown(event) {
   if (isTyping(event.target)) return
   // 绘制中：Enter 完成 / Esc 取消 / Backspace 退点
@@ -60,14 +85,43 @@ function onKeydown(event) {
       return
     }
   }
+  const mod = event.ctrlKey || event.metaKey
   // Ctrl/Cmd+Z：撤销上一步点标签
-  if ((event.ctrlKey || event.metaKey) && (event.key === 'z' || event.key === 'Z')) {
-    if (viewerRef.current?.undoLabel()) ElMessage.info('已撤销上一步标签')
+  if (mod && (event.key === 'z' || event.key === 'Z')) {
+    if (viewerRef.current?.undoLabel()) {
+      store.bumpLabelVersion()
+      state.selectedSegment = null
+      ElMessage.info('已撤销上一步标签')
+    }
     event.preventDefault()
     return
   }
-  // 其他组合键（Ctrl+A / Ctrl+L 等）交给浏览器/系统处理
-  if (event.ctrlKey || event.metaKey || event.altKey) return
+  // 多选与复制粘贴
+  if (mod && (event.key === 'c' || event.key === 'C')) {
+    const n = copySelected()
+    if (n) ElMessage.success(`已复制 ${n} 个对象`)
+    event.preventDefault()
+    return
+  }
+  if (mod && (event.key === 'v' || event.key === 'V')) {
+    const n = pasteObjects({ inPlace: event.shiftKey })
+    if (n) ElMessage.success(`已粘贴 ${n} 个对象`)
+    event.preventDefault()
+    return
+  }
+  if (mod && (event.key === 'd' || event.key === 'D')) {
+    const n = duplicateSelected()
+    if (n) ElMessage.success(`已复制 ${n} 个对象`)
+    event.preventDefault()
+    return
+  }
+  if (mod && (event.key === 'a' || event.key === 'A')) {
+    selectObjects(store.currentObjects.value.map((o) => o.id))
+    event.preventDefault()
+    return
+  }
+  // 其他组合键交给浏览器/系统处理
+  if (mod || event.altKey) return
   switch (event.key) {
     case 'ArrowLeft':
       store.step(-1)
@@ -111,9 +165,12 @@ function onKeydown(event) {
     case 'F':
       viewerRef.current?.fitView()
       break
+    case 'Escape':
+      clearSelection()
+      break
     case 'Delete':
     case 'Backspace':
-      if (selectedObject.value) requestRemoveObject(selectedObject.value)
+      if (selectedObjects.value.length) requestRemoveObjects(selectedObjects.value)
       break
     default:
       return
@@ -129,19 +186,23 @@ function onKeydown(event) {
  */
 onMounted(() => {
   window.addEventListener('keydown', onKeydown)
+  window.addEventListener('beforeunload', onBeforeUnload)
   const params = new URLSearchParams(location.search)
   const ds = params.get('dataset')
   if (!ds && !params.has('seq')) return
   const id = ds && ds !== 'sequence' ? ds : null
   const resolved = id ? Promise.resolve(id) : store.listSampleDatasets().then((list) => list[0]?.id)
   resolved
+    // loadSampleDataset 内部会自动导入全量真值（?gt=1 仍然兼容）
     .then((datasetId) => (datasetId ? store.loadSampleDataset(datasetId) : null))
-    .then(() => (params.has('gt') ? store.importGroundTruth() : null))
     .catch((err) => {
       state.error = err.message || String(err)
     })
 })
-onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
+onBeforeUnmount(() => {
+  window.removeEventListener('keydown', onKeydown)
+  window.removeEventListener('beforeunload', onBeforeUnload)
+})
 </script>
 
 <template>

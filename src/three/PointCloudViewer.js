@@ -31,8 +31,8 @@ import { get } from '../utils/http.js'
 /** 帧级点云缓存上限（超出后按 LRU 淘汰） */
 const MAX_CACHE = 8
 
-/** 标签数据缓存上限（点云被淘汰后标签仍保留，避免切帧丢失标注） */
-const MAX_LABEL_FRAMES = 16
+/** 已编辑帧的标签缓存上限（真值共享模板不计入，且 dirty 帧不会被淘汰） */
+const MAX_LABEL_FRAMES = 64
 
 /**
  * 鼠标按键映射：
@@ -72,8 +72,9 @@ export class PointCloudViewer {
 
     /* ---------- 渲染器 ---------- */
     this.renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' })
-    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2))
+    this.renderer.setPixelRatio(this._pixelRatio())
     container.appendChild(this.renderer.domElement)
+    this._perf = { fps: 0, frameMs: 0, frames: 0, last: performance.now() }
 
     /* ---------- 轨道控制器（左键平移 / 右键旋转） ---------- */
     this.controls = new OrbitControls(this.camera, this.renderer.domElement)
@@ -123,6 +124,7 @@ export class PointCloudViewer {
     this.drawWidth = 0.15
     this.drawHeading = 0
     this.groundZ = -1.73
+    this.snapToPoints = true // 拖拽标线顶点时吸附到最近点云
     this._drawPreview = null
 
     /* ---------- 缩放手柄（自定义，替代 TransformControls 的 scale 模式） ---------- */
@@ -153,7 +155,46 @@ export class PointCloudViewer {
     // 拖动手柄时禁用轨道控制器，避免相机与框一起动
     this.transform.addEventListener('dragging-changed', (e) => {
       this.controls.enabled = !e.value
-      this._draggingGizmo = e.value
+      const isGroup = this.groupGizmoIds.length > 0
+      this._draggingGizmo = !isGroup && e.value
+      if (isGroup) {
+        if (e.value) {
+          this._groupDragging = true
+          this._groupStart = this.groupPivot.position.clone()
+          this._groupStartRotation = this.groupPivot.rotation.z
+          this._groupRotateCenter = this.groupPivot.position.clone()
+          this._groupStartPositions = this.groupGizmoIds
+            .map((id) => {
+              const box = this.boxes.get(id)
+              if (box) return { id, box, mark: null, start: box.group.position.clone() }
+              const mark = this.marks.get(id)
+              if (mark) return { id, box: null, mark, start: mark.group.position.clone() }
+              return null
+            })
+            .filter(Boolean)
+        } else if (this._groupDragging) {
+          this._groupDragging = false
+          const ids = this.groupGizmoIds.slice()
+          if (this._groupMode === 'rotate') {
+            const angle = this.groupPivot.rotation.z - this._groupStartRotation
+            this._groupStart = null
+            this._groupStartPositions = null
+            this._groupRotateCenter = null
+            this.callbacks.onGroupRotate?.(ids[0], angle)
+          } else {
+            const start = this._groupStart
+            const dx = start ? this.groupPivot.position.x - start.x : 0
+            const dy = start ? this.groupPivot.position.y - start.y : 0
+            // 混合选择（含标线）强制 XY，忽略 Z，避免标线离开地面
+            const dz = start && this._groupAllowZ ? this.groupPivot.position.z - start.z : 0
+            this._groupStart = null
+            this._groupStartPositions = null
+            this._groupRotateCenter = null
+            this.callbacks.onGroupCommit?.(ids, { dx, dy, dz })
+          }
+        }
+        return
+      }
       if (!e.value && this.gizmoObjectId && this.boxes.has(this.gizmoObjectId)) {
         // 松手：把最终变换回传（期间不回写，避免与手柄相互覆盖）
         this.callbacks.onBoxChange?.(this.gizmoObjectId, this.boxes.get(this.gizmoObjectId).readTransform())
@@ -161,6 +202,37 @@ export class PointCloudViewer {
     })
     // 手柄变换后把新的位姿回传给上层（写回 store）
     this.transform.addEventListener('objectChange', () => {
+      if (this._groupDragging) {
+        if (this._groupMode === 'rotate') {
+          const center = this._groupRotateCenter
+          if (!center) return
+          const angle = this.groupPivot.rotation.z - this._groupStartRotation
+          const cos = Math.cos(angle)
+          const sin = Math.sin(angle)
+          // 标线几何是世界坐标：绕中心 C 旋转等价于 group.rotation + position = C - R*C
+          for (const id of this.groupGizmoIds) {
+            const mark = this.marks.get(id)
+            if (!mark) continue
+            mark.group.rotation.z = angle
+            mark.group.position.set(
+              center.x - (center.x * cos - center.y * sin),
+              center.y - (center.x * sin + center.y * cos),
+              0,
+            )
+          }
+          return
+        }
+        const start = this._groupStart
+        if (!start) return
+        const dx = this.groupPivot.position.x - start.x
+        const dy = this.groupPivot.position.y - start.y
+        const dz = this._groupAllowZ ? this.groupPivot.position.z - start.z : 0
+        for (const item of this._groupStartPositions || []) {
+          item.box?.group.position.set(item.start.x + dx, item.start.y + dy, item.start.z + dz)
+          item.mark?.group.position.set(item.start.x + dx, item.start.y + dy, item.start.z + dz)
+        }
+        return
+      }
       if (this.gizmoObjectId && this.boxes.has(this.gizmoObjectId)) {
         const box = this.boxes.get(this.gizmoObjectId)
         this.callbacks.onBoxChange?.(this.gizmoObjectId, box.readTransform())
@@ -168,6 +240,18 @@ export class PointCloudViewer {
     })
     this.scene.add(this.transform.getHelper())
     this.gizmoObjectId = null
+
+    /* ---------- 多选整体平移 ---------- */
+    this.groupPivot = new THREE.Object3D()
+    this.scene.add(this.groupPivot)
+    this.groupGizmoIds = []
+    this._groupDragging = false
+    this._groupStart = null
+    this._groupStartPositions = null
+    this._groupAllowZ = false
+    this._groupMode = 'translate'
+    this._groupStartRotation = 0
+    this._groupRotateCenter = null
 
     /* ---------- 点云对象 ---------- */
     this.pointObject = null
@@ -181,8 +265,16 @@ export class PointCloudViewer {
     this.currentCloud = null
     this.currentKey = null
     this.cache = new Map()
-    this.labelsByKey = new Map() // 按帧缓存键保存点级标签，独立于点云 LRU 缓存
+    this.inflight = new Map() // key -> Promise，避免同一帧重复请求
+    // 演示/弱网默认关闭预取；需要时用 ?prefetch=1 开启（只预取下一帧）
+    this.prefetchEnabled = new URLSearchParams(location.search).get('prefetch') === '1'
+    this._prefetchQueue = []
+    this._prefetching = false
+    this._prefetchTimer = null
+    this.labelsByKey = new Map() // 已编辑帧的点级标签（独立于点云 LRU 缓存）
     this.pointLabelFiles = new Map() // 点级标签文件缓存（URL -> 解析结果），避免逐帧重复请求
+    this.pointLabelTemplates = new Map() // 共享真值模板（URL -> 只读数组），未编辑帧直接复用
+    this.pointLabelFailed = new Set() // 加载失败的标签 URL，避免每帧重试拖慢点云显示
     this.colorMode = 'intensity'
 
     /* ---------- 拾取相关 ---------- */
@@ -196,6 +288,7 @@ export class PointCloudViewer {
     this.segMode = 'rect' // rect | brush | lasso
     this.brushSize = 24
     this.selectionMask = null // Uint8Array，1 表示该点被选中（待提交）
+    this.selectionIndices = [] // 已选中的点索引，避免每次都全量扫描 40 万点
     this.selectionCount = 0
     this.segOverwrite = true // 新标签是否覆盖已有标签
     this.baseColors = null // 未叠加高亮前的原始颜色
@@ -206,6 +299,7 @@ export class PointCloudViewer {
     this._pendingBrush = null // 画笔节流用
     this._brushRaf = 0
     this._projector = new THREE.Vector3() // 复用的投影临时向量
+    this._screen = { x: 0, y: 0, z: 0 } // 复用的屏幕坐标，避免逐点分配对象
 
     /* ---------- 事件绑定 ---------- */
     this._onResize = this._onResize.bind(this)
@@ -230,9 +324,43 @@ export class PointCloudViewer {
 
   /** 渲染循环 */
   _animate() {
+    const now = performance.now()
     this.controls.update() // damping 需要每帧 update
     this._updateHandleScales()
     this.renderer.render(this.scene, this.camera)
+    const perf = this._perf
+    perf.frames++
+    const dt = now - perf.last
+    if (dt >= 500) {
+      perf.fps = Math.round((perf.frames * 1000) / dt)
+      perf.frameMs = Number((dt / perf.frames).toFixed(1))
+      perf.frames = 0
+      perf.last = now
+    }
+  }
+
+  /** URL 参数 ?dpr=1 / ?quality=low 可强制降低渲染分辨率 */
+  _pixelRatio() {
+    const params = new URLSearchParams(location.search)
+    const forced = Number(params.get('dpr'))
+    if (forced > 0) return Math.min(forced, 2)
+    if (params.get('quality') === 'low') return 1
+    const dpr = window.devicePixelRatio || 1
+    const w = this.container.clientWidth || window.innerWidth || 1
+    const h = this.container.clientHeight || window.innerHeight || 1
+    // 控制总像素量，避免 4K/高分屏 + 40 万点造成填充率瓶颈
+    const byArea = Math.sqrt(2_500_000 / Math.max(1, w * h))
+    return Math.max(0.75, Math.min(dpr, 1.5, byArea))
+  }
+
+  getPerfStats() {
+    const info = this.renderer.info
+    return {
+      ...this._perf,
+      calls: info.render.calls,
+      triangles: info.render.triangles,
+      points: info.render.points,
+    }
   }
 
   /** 顶点手柄按相机距离缩放，保证屏幕上大小稳定、始终好点中 */
@@ -250,6 +378,7 @@ export class PointCloudViewer {
     const h = this.container.clientHeight || 1
     this.camera.aspect = w / h
     this.camera.updateProjectionMatrix()
+    this.renderer.setPixelRatio(this._pixelRatio())
     this.renderer.setSize(w, h, false)
   }
 
@@ -318,7 +447,7 @@ export class PointCloudViewer {
       return
     }
     if (this.drawMode) {
-      this.drawHover = this._groundPoint(event)
+      this.drawHover = this._drawPoint(event)
       this._updateDrawPreview()
       return
     }
@@ -432,14 +561,15 @@ export class PointCloudViewer {
     this._updatePointer(event)
     this.raycaster.setFromCamera(this.pointer, this.camera)
     const hits = this.raycaster.intersectObjects([...this.boxRoot.children, ...this.markRoot.children], true)
+    const additive = event.ctrlKey || event.metaKey
     for (const hit of hits) {
       const pick = hit.object.userData.pick
       if (pick && (pick.kind === 'box' || pick.kind === 'mark')) {
-        this.callbacks.onSelect?.(pick.ref.objectId)
+        this.callbacks.onSelect?.(pick.ref.objectId, { additive })
         return
       }
     }
-    this.callbacks.onSelect?.(null)
+    this.callbacks.onSelect?.(null, { additive })
   }
 
   /** 双击：绘制模式下完成当前标线 */
@@ -459,6 +589,11 @@ export class PointCloudViewer {
     this.controls.mouseButtons = next ? { ...MOUSE_DRAW } : this.segEnabled ? { ...MOUSE_SEGMENT } : { ...MOUSE_DEFAULT }
     this._updateDrawPreview()
     this.callbacks.onDrawChange?.(this.drawPoints.length)
+  }
+
+  /** 开关顶点拖拽吸附 */
+  setSnapEnabled(enabled) {
+    this.snapToPoints = !!enabled
   }
 
   /** 同步绘制选项 */
@@ -515,7 +650,7 @@ export class PointCloudViewer {
 
   /** 左键落点；模板箭头单击即放置 */
   _handleDrawClick(event) {
-    const p = this._groundPoint(event)
+    const p = this._drawPoint(event)
     if (!p) return
     if (this.drawMode === 'arrow' && this.drawTemplate !== 'free') {
       const paths = transformTemplate(this.drawTemplate, {
@@ -541,6 +676,14 @@ export class PointCloudViewer {
     this.drawHover = p
     this._updateDrawPreview()
     this.callbacks.onDrawChange?.(this.drawPoints.length)
+  }
+
+  /** 绘制落点：地面交点 + 可选的点云吸附 */
+  _drawPoint(event) {
+    const p = this._groundPoint(event)
+    if (!p || !this.snapToPoints || !this.currentCloud) return p
+    const snapped = this._snapToNearestPoint(this.currentCloud, p, this._snapRadius())
+    return snapped || p
   }
 
   /**
@@ -622,7 +765,8 @@ export class PointCloudViewer {
    * @param {Array} classes 类别表
    * @param {string|null} selectedId 选中对象 id
    */
-  syncMarks(objects, classes, selectedId) {
+  syncMarks(objects, classes, selectedIds) {
+    const selected = toIdSet(selectedIds)
     const seen = new Set()
     const colorOf = (classId) => {
       const c = classes.find((x) => x.id === classId)
@@ -637,8 +781,12 @@ export class PointCloudViewer {
         this.marks.set(obj.id, mark)
         this.markRoot.add(mark.group)
       }
+      if (!this._groupDragging) {
+        mark.group.position.set(0, 0, 0)
+        mark.group.rotation.set(0, 0, 0)
+      }
       mark.apply(obj, colorOf(obj.classId))
-      mark.setSelected(obj.id === selectedId)
+      mark.setSelected(selected.has(obj.id))
     }
     for (const [id, mark] of Array.from(this.marks.entries())) {
       if (!seen.has(id)) {
@@ -655,7 +803,7 @@ export class PointCloudViewer {
     }
     // 选中标线时显示顶点手柄（拖动过程中不重建，否则会丢失当前拖拽的 mesh）
     if (this.vertexDrag) return
-    const sel = objects.find((o) => o.id === selectedId)
+    const sel = selected.size === 1 ? objects.find((o) => selected.has(o.id)) : null
     if (sel && (sel.shape === 'line' || sel.shape === 'arrow')) {
       // 顶点数量与对象一致时只更新位置，避免每次同步都重建
       const count = sel.shape === 'line' ? sel.points?.length || 0 : (sel.paths || []).reduce((s, p) => s + p.length, 0)
@@ -729,10 +877,80 @@ export class PointCloudViewer {
     if (!st) return
     // 保持顶点原有高度（标线通常比地面略高），只改平面位置
     const z = st.mesh.position.z
-    const p = this._groundPoint(event, z)
+    let p = this._groundPoint(event, z)
     if (!p) return
+    // 自动吸附到最近的点云点，使顶点贴合真实路面/标线点
+    if (this.snapToPoints && this.currentCloud) {
+      const snapped = this._snapToNearestPoint(this.currentCloud, p, this._snapRadius())
+      if (snapped) p = snapped
+    }
     st.mesh.position.set(p[0], p[1], p[2])
     this.callbacks.onVertexChange?.(st.objId, st.index, p, st.pathIndex)
+  }
+
+  /** 吸附搜索半径：随相机距离缩放，近距离更精确、远距离更好点中 */
+  _snapRadius() {
+    const d = this.camera.position.distanceTo(this.controls.target)
+    return Math.min(1.5, Math.max(0.2, d * 0.02))
+  }
+
+  /**
+   * 在点云中查找距离目标点最近的点（3D 距离，带高度容差过滤）
+   * 使用 XY 平面网格加速，首次调用时为当前点云建立空间索引并缓存。
+   * @param {object} cloud
+   * @param {number[]} target [x,y,z]
+   * @param {number} maxDist 最大吸附距离（米）
+   * @returns {number[]|null} [x,y,z]
+   */
+  _snapToNearestPoint(cloud, target, maxDist = 0.5) {
+    const { cell, grid, pos, count } = this._ensureSnapGrid(cloud)
+    const cx = Math.floor(target[0] / cell)
+    const cy = Math.floor(target[1] / cell)
+    const r = Math.ceil(maxDist / cell)
+    // 高度容差：优先吸附到与顶点同一高度层的地面/标线点，避免吸到车身、建筑上
+    const zTol = Math.min(0.8, Math.max(0.4, maxDist))
+    let best = -1
+    let bestD2 = maxDist * maxDist
+    for (let ix = cx - r; ix <= cx + r; ix++) {
+      for (let iy = cy - r; iy <= cy + r; iy++) {
+        const arr = grid.get(ix * 100000 + iy)
+        if (!arr) continue
+        for (let k = 0; k < arr.length; k++) {
+          const i = arr[k]
+          const dx = pos[i * 3] - target[0]
+          const dy = pos[i * 3 + 1] - target[1]
+          const dz = pos[i * 3 + 2] - target[2]
+          if (Math.abs(dz) > zTol) continue
+          const d2 = dx * dx + dy * dy + dz * dz
+          if (d2 < bestD2) {
+            bestD2 = d2
+            best = i
+          }
+        }
+      }
+    }
+    if (best < 0 || best >= count) return null
+    return [pos[best * 3], pos[best * 3 + 1], pos[best * 3 + 2]]
+  }
+
+  /** 为点云建立/复用 XY 网格索引 */
+  _ensureSnapGrid(cloud) {
+    if (cloud._snapGrid) return cloud._snapGrid
+    const cell = 0.5
+    const grid = new Map()
+    const pos = cloud.positions
+    const count = cloud.pointCount
+    for (let i = 0; i < count; i++) {
+      const key = Math.floor(pos[i * 3] / cell) * 100000 + Math.floor(pos[i * 3 + 1] / cell)
+      let arr = grid.get(key)
+      if (!arr) {
+        arr = []
+        grid.set(key, arr)
+      }
+      arr.push(i)
+    }
+    cloud._snapGrid = { cell, grid, pos, count }
+    return cloud._snapGrid
   }
 
   _endVertexDrag() {
@@ -750,7 +968,7 @@ export class PointCloudViewer {
   }
 
   /** 取帧点云（命中缓存则提升为最近使用，否则加载并写入 LRU 缓存） */
-  async getCloud(frame) {
+  async getCloud(frame, options = {}) {
     const key = this.cacheKeyFor(frame)
     if (this.cache.has(key)) {
       const entry = this.cache.get(key)
@@ -758,25 +976,85 @@ export class PointCloudViewer {
       this.cache.set(key, entry)
       return entry
     }
-    const cloud = await loadPointCloud(frame.source)
-    cloud.key = key
-    this._attachSavedLabels(cloud)
-    this.cache.set(key, cloud)
-    while (this.cache.size > MAX_CACHE) {
-      const oldest = this.cache.keys().next().value
-      this.cache.delete(oldest)
-    }
-    return cloud
+    if (this.inflight.has(key)) return this.inflight.get(key)
+    const promise = loadPointCloud(frame.source, { signal: options.signal })
+      .then((cloud) => {
+        cloud.key = key
+        this._attachSavedLabels(cloud)
+        this.cache.set(key, cloud)
+        while (this.cache.size > MAX_CACHE) {
+          const oldest = this.cache.keys().next().value
+          const evicted = this.cache.get(oldest)
+          if (evicted) evicted._snapGrid = null // 释放空间索引，避免缓存多帧时内存膨胀
+          this.cache.delete(oldest)
+        }
+        return cloud
+      })
+      .finally(() => {
+        this.inflight.delete(key)
+      })
+    this.inflight.set(key, promise)
+    return promise
   }
 
-  /** 显示某一帧（加载 + 构建几何体） */
-  async showFrame(frame) {
-    const cloud = await this.getCloud(frame)
-    await this._loadPointLabels(frame, cloud)
-    // 标签可能在点云加载之后才就绪，这里再挂一次，保证首次显示即为标签着色
-    if (!cloud.pointLabels) this._attachSavedLabels(cloud)
+  /**
+   * 可选预取：默认关闭。开启后只预取下一帧，并延迟 1.5 秒，
+   * 避免后台 Worker/下载和用户正在切换的当前帧抢资源。
+   */
+  prefetchFrames(frames, index) {
+    if (!this.prefetchEnabled || !frames?.length) return
+    this._prefetchQueue = []
+    const next = frames[index + 1] || frames[index - 1]
+    if (!next) return
+    const key = this.cacheKeyFor(next)
+    if (this.cache.has(key) || this.inflight.has(key)) return
+    this._prefetchQueue.push(next)
+    if (this._prefetchTimer) clearTimeout(this._prefetchTimer)
+    this._prefetchTimer = setTimeout(() => {
+      this._prefetchTimer = null
+      this._drainPrefetch()
+    }, 1500)
+  }
+
+  /** 切帧/切数据集/卸载时清空预取队列 */
+  clearPrefetch() {
+    this._prefetchQueue = []
+    if (this._prefetchTimer) {
+      clearTimeout(this._prefetchTimer)
+      this._prefetchTimer = null
+    }
+  }
+
+  _drainPrefetch() {
+    if (!this.prefetchEnabled || this._prefetching) return
+    const next = this._prefetchQueue.shift()
+    if (!next) return
+    this._prefetching = true
+    const run = () => {
+      this.getCloud(next)
+        .catch(() => {})
+        .finally(() => {
+          this._prefetching = false
+          this._drainPrefetch()
+        })
+    }
+    if (typeof requestIdleCallback === 'function') requestIdleCallback(run, { timeout: 1000 })
+    else setTimeout(run, 30)
+  }
+
+  /** 显示某一帧：点云先上屏，点标签在后台异步加载 */
+  async showFrame(frame, options = {}) {
+    const cloud = await this.getCloud(frame, options)
+    // 点云优先显示，绝不等待点标签网络请求
     this.setCloud(cloud)
     frame.pointCount = cloud.pointCount
+    this._loadPointLabels(frame, cloud)
+      .then((loaded) => {
+        if (!loaded) return
+        if (this.currentCloud === cloud && this.colorMode === 'label') this.refreshColors()
+        this.callbacks.onLabelsLoaded?.(frame, cloud)
+      })
+      .catch(() => {})
     return cloud
   }
 
@@ -786,40 +1064,66 @@ export class PointCloudViewer {
    * 失败只告警，不影响点云显示。
    */
   async _loadPointLabels(frame, cloud) {
-    if (!frame?.pointLabelsUrl || !cloud?.key) return
-    if (this.labelsByKey.has(cloud.key)) return
+    if (!frame?.pointLabelsUrl || !cloud?.key) return false
+    if (this.labelsByKey.has(cloud.key)) return false
+    if (cloud.pointLabels) return false
+    if (this.pointLabelFailed.has(frame.pointLabelsUrl)) return false
     try {
-      let data = this.pointLabelFiles.get(frame.pointLabelsUrl)
-      if (!data) {
-        data = await get(frame.pointLabelsUrl, null, { silent: true })
-        this.pointLabelFiles.set(frame.pointLabelsUrl, data)
-      }
-      if (!data || !Array.isArray(data.segments)) return
-      const n = cloud.pointCount
-      const labels = new Int32Array(n).fill(-1)
-      const pointSegment = new Int32Array(n).fill(-1)
-      const segments = []
-      let segId = 0
-      for (const seg of data.segments) {
-        const classId = Number(seg.classId)
-        const indices = (seg.indices || []).filter((i) => Number.isInteger(i) && i >= 0 && i < n)
-        if (!indices.length) continue
-        const id = ++segId
-        segments.push({ id, classId, indices: Int32Array.from(indices) })
-        for (const i of indices) {
-          labels[i] = classId
-          pointSegment[i] = id
+      let template = this.pointLabelTemplates.get(frame.pointLabelsUrl)
+      if (!template) {
+        let data = this.pointLabelFiles.get(frame.pointLabelsUrl)
+        if (!data) {
+          data = await withTimeout(
+            get(frame.pointLabelsUrl, null, { silent: true }),
+            5000,
+            '点级标签加载超时',
+          )
+          this.pointLabelFiles.set(frame.pointLabelsUrl, data)
         }
+        if (!data || !Array.isArray(data.segments)) {
+          this.pointLabelFailed.add(frame.pointLabelsUrl)
+          return false
+        }
+        const n = cloud.pointCount
+        const labels = new Int32Array(n).fill(-1)
+        const pointSegment = new Int32Array(n).fill(-1)
+        const segments = []
+        let segId = 0
+        for (const seg of data.segments) {
+          const classId = Number(seg.classId)
+          const indices = (seg.indices || []).filter((i) => Number.isInteger(i) && i >= 0 && i < n)
+          if (!indices.length) continue
+          const id = ++segId
+          segments.push({ id, classId, indices: Int32Array.from(indices) })
+          for (const i of indices) {
+            labels[i] = classId
+            pointSegment[i] = id
+          }
+        }
+        if (!segments.length) {
+          this.pointLabelFailed.add(frame.pointLabelsUrl)
+          return false
+        }
+        template = { pointLabels: labels, pointSegment, segments, pointCount: n }
+        this.pointLabelTemplates.set(frame.pointLabelsUrl, template)
+        this.segmentSeq = Math.max(this.segmentSeq, segId)
       }
-      if (!segments.length) return
-      this.segmentSeq = Math.max(this.segmentSeq, segId)
-      this.labelsByKey.set(cloud.key, { pointLabels: labels, pointSegment, segments, labelHistory: [] })
-      // 与手工标签共用同一个 LRU 上限，避免逐帧浏览大场景时内存持续增长
-      while (this.labelsByKey.size > MAX_LABEL_FRAMES) {
-        this.labelsByKey.delete(this.labelsByKey.keys().next().value)
+      if (template.pointCount !== cloud.pointCount) {
+        this.pointLabelFailed.add(frame.pointLabelsUrl)
+        return false
       }
+      // 未编辑帧共享同一份只读真值模板，显著降低多帧浏览时的内存
+      cloud.pointLabels = template.pointLabels
+      cloud.pointSegment = template.pointSegment
+      cloud.segments = template.segments
+      cloud.labelHistory = []
+      cloud._labelsShared = true
+      cloud._labelsTemplateUrl = frame.pointLabelsUrl
+      return true
     } catch (err) {
+      this.pointLabelFailed.add(frame.pointLabelsUrl)
       console.warn('[PointCloudViewer] 点级标签加载失败:', frame.pointLabelsUrl, err)
+      return false
     }
   }
 
@@ -829,8 +1133,9 @@ export class PointCloudViewer {
     const geometry = new THREE.BufferGeometry()
     geometry.setAttribute('position', new THREE.BufferAttribute(cloud.positions, 3))
     // baseColors 保存「真实颜色」，renderColors 是叠加选中高亮后的渲染颜色
-    this.baseColors = Float32Array.from(this._computeColors(cloud))
-    this.renderColors = Float32Array.from(this.baseColors)
+    const computed = this._computeColors(cloud)
+    this.baseColors = computed === cloud.colors ? new Float32Array(computed) : computed
+    this.renderColors = new Float32Array(this.baseColors)
     geometry.setAttribute('color', new THREE.BufferAttribute(this.renderColors, 3))
     geometry.computeBoundingSphere()
 
@@ -845,6 +1150,7 @@ export class PointCloudViewer {
 
     // 切换帧后清空上一次的选中与未完成的绘制草稿
     this.selectionMask = null
+    this.selectionIndices = []
     this.selectionCount = 0
     this.selectedSegmentId = null
     if (this.drawPoints.length) this._resetDraft()
@@ -884,28 +1190,28 @@ export class PointCloudViewer {
     if (!this.pointGeometry || !this.baseColors || !this.renderColors) return
     const base = this.baseColors
     const out = this.renderColors
-    const mask = this.selectionMask
     const cloud = this.currentCloud
     const segId = this.selectedSegmentId
     const pointSeg = segId != null ? cloud?.pointSegment : null
-    const n = base.length / 3
-    for (let i = 0; i < n; i++) {
-      const j = i * 3
-      if (mask && mask[i]) {
-        // 待提交的选中点：黄色
-        out[j] = 1
-        out[j + 1] = 0.92
-        out[j + 2] = 0.25
-      } else if (pointSeg && pointSeg[i] === segId) {
-        // 被选中用于编辑的标签片段：白色描亮
-        out[j] = 1
-        out[j + 1] = 1
-        out[j + 2] = 1
-      } else {
-        out[j] = base[j]
-        out[j + 1] = base[j + 1]
-        out[j + 2] = base[j + 2]
+    // 原生拷贝 base，随后只绘制少量高亮点，避免每次全量逐点判断
+    out.set(base)
+    if (pointSeg) {
+      const seg = cloud?.segments?.find((s) => s.id === segId)
+      if (seg) {
+        for (const i of seg.indices) {
+          if (pointSeg[i] !== segId) continue
+          const j = i * 3
+          out[j] = 1
+          out[j + 1] = 1
+          out[j + 2] = 1
+        }
       }
+    }
+    for (const i of this.selectionIndices) {
+      const j = i * 3
+      out[j] = 1
+      out[j + 1] = 0.92
+      out[j + 2] = 0.25
     }
     this.pointGeometry.getAttribute('color').needsUpdate = true
   }
@@ -961,7 +1267,8 @@ export class PointCloudViewer {
    * @param {Array} classes 类别表（用于取颜色）
    * @param {string|null} selectedId 选中对象 id
    */
-  syncBoxes(objects, classes, selectedId) {
+  syncBoxes(objects, classes, selectedIds) {
+    const selected = toIdSet(selectedIds)
     const seen = new Set()
     const colorOf = (classId) => {
       const c = classes.find((x) => x.id === classId)
@@ -977,11 +1284,11 @@ export class PointCloudViewer {
       }
       // 正在拖动的框由手柄直接控制，此处不回写，避免把尺寸乘子复位导致跳变
       if (obj.id === this.gizmoObjectId && this._draggingGizmo) {
-        box.setSelected(obj.id === selectedId)
+        box.setSelected(selected.has(obj.id))
         continue
       }
       box.apply(obj, colorOf(obj.classId))
-      box.setSelected(obj.id === selectedId)
+      box.setSelected(selected.has(obj.id))
     }
     for (const [id, box] of Array.from(this.boxes.entries())) {
       if (!seen.has(id)) {
@@ -994,20 +1301,104 @@ export class PointCloudViewer {
     this._refreshScaleHandles()
   }
 
+  /** 解绑整体平移/旋转手柄 */
+  detachGroupGizmo() {
+    if (!this.groupGizmoIds.length) return
+    this.groupGizmoIds = []
+    this._groupDragging = false
+    this._groupStart = null
+    this._groupStartPositions = null
+    this._groupAllowZ = false
+    this._groupMode = 'translate'
+    this._groupStartRotation = 0
+    this._groupRotateCenter = null
+    this.groupPivot.rotation.set(0, 0, 0)
+    this.transform.detach()
+  }
+
   /** 绑定/解绑编辑手柄：平移/旋转用 TransformControls，缩放用自定义手柄 */
   attachGizmo(objectId) {
+    this.detachGroupGizmo()
     this.gizmoObjectId = objectId
     const noGizmo = ['select', 'scale', 'line', 'arrow']
     const usable = objectId && this.boxes.has(objectId) && !noGizmo.includes(this.activeTool)
-    if (usable) this.transform.attach(this.boxes.get(objectId).group)
-    else this.transform.detach()
+    if (usable) {
+      if (this.activeTool === 'rotate') {
+        this.transform.showX = false
+        this.transform.showY = false
+        this.transform.showZ = true
+      } else {
+        this.transform.showX = true
+        this.transform.showY = true
+        this.transform.showZ = true
+      }
+      this.transform.attach(this.boxes.get(objectId).group)
+    } else this.transform.detach()
     this._refreshScaleHandles()
+  }
+
+  /**
+   * 整体平移/旋转：单条标线或多选对象。手柄挂到选中对象质心的临时对象上。
+   * 混合选择（框+标线）只开放 XY 平移，避免标线离开地面；全是框时开放 Z。
+   * @param {string[]} ids
+   * @param {'translate'|'rotate'} [mode]
+   * @param {[number,number,number]|null} [centerOverride] 单条标线使用顶点质心，保证旋转中心一致
+   */
+  attachGroupGizmo(ids, mode = 'translate', centerOverride = null) {
+    this.detachGroupGizmo()
+    this.transform.detach()
+    this.gizmoObjectId = null
+    this._refreshScaleHandles()
+    const unique = Array.from(new Set(ids || []))
+    if (!unique.length) {
+      this.detachGroupGizmo()
+      return
+    }
+    const rotate = mode === 'rotate'
+    if (rotate && unique.length !== 1) return
+    const allBoxes = unique.every((id) => this.boxes.has(id))
+    const center = new THREE.Vector3()
+    if (centerOverride) {
+      center.set(centerOverride[0], centerOverride[1], centerOverride[2] || 0)
+    } else {
+      const centers = []
+      for (const id of unique) {
+        const box = this.boxes.get(id)
+        if (box) {
+          centers.push(box.group.position)
+          continue
+        }
+        const mark = this.marks.get(id)
+        const c = mark?.center()
+        if (c) centers.push(c)
+      }
+      if (!centers.length) {
+        this.detachGroupGizmo()
+        return
+      }
+      for (const p of centers) center.add(p)
+      center.divideScalar(centers.length)
+    }
+    const allowZ = !rotate && allBoxes
+    this.groupPivot.position.copy(center)
+    this.groupPivot.rotation.set(0, 0, 0)
+    this.groupPivot.updateMatrixWorld()
+    this.groupGizmoIds = unique
+    this._groupMode = rotate ? 'rotate' : 'translate'
+    this._groupAllowZ = allowZ
+    this.transform.setMode(rotate ? 'rotate' : 'translate')
+    this.transform.showX = !rotate
+    this.transform.showY = !rotate
+    this.transform.showZ = rotate || allowZ
+    this.transform.attach(this.groupPivot)
+    this.controls.enabled = true
   }
 
   /** 切换工具：平移/旋转 -> TransformControls；缩放 -> 自定义面手柄；绘制模式不显示手柄 */
   setGizmoMode(mode) {
     if (!['select', 'translate', 'rotate', 'scale', 'line', 'arrow'].includes(mode)) return
     this.activeTool = mode
+    if (mode !== 'translate') this.detachGroupGizmo()
     if (mode === 'line' || mode === 'arrow') {
       this.transform.detach()
       this._refreshScaleHandles()
@@ -1178,26 +1569,28 @@ export class PointCloudViewer {
     const n = this.currentCloud.pointCount
     if (!this.selectionMask || this.selectionMask.length !== n) {
       this.selectionMask = new Uint8Array(n)
+      this.selectionIndices = []
       this.selectionCount = 0
     }
     return this.selectionMask
   }
 
-  /** 掩码变化后：重算选中数、刷新高亮颜色、通知上层 */
+  /** 掩码变化后：更新选中数、刷新高亮颜色、通知上层 */
   _afterMaskChange() {
-    let count = 0
-    const mask = this.selectionMask
-    for (let i = 0; i < mask.length; i++) if (mask[i]) count++
-    this.selectionCount = count
+    this.selectionCount = this.selectionIndices.length
     this._paintColors()
-    this.callbacks.onSelection?.(count)
+    this.callbacks.onSelection?.(this.selectionCount)
   }
 
-  /** 世界坐标 -> 屏幕像素坐标（并返回 NDC 深度 z 用于裁剪判断） */
+  /** 世界坐标 -> 屏幕像素坐标（复用对象，避免逐点分配） */
   _projectToScreen(pos, i, W, H) {
     const v = this._projector
     v.set(pos[i * 3], pos[i * 3 + 1], pos[i * 3 + 2]).project(this.camera)
-    return { x: (v.x * 0.5 + 0.5) * W, y: (-v.y * 0.5 + 0.5) * H, z: v.z }
+    const s = this._screen
+    s.x = (v.x * 0.5 + 0.5) * W
+    s.y = (-v.y * 0.5 + 0.5) * H
+    s.z = v.z
+    return s
   }
 
   /** 选中投影落在屏幕矩形内的所有点 */
@@ -1215,7 +1608,10 @@ export class PointCloudViewer {
     for (let i = 0; i < n; i++) {
       const p = this._projectToScreen(pos, i, W, H)
       if (p.z < -1 || p.z > 1) continue // 裁剪面之外
-      if (p.x >= minx && p.x <= maxx && p.y >= miny && p.y <= maxy) mask[i] = 1
+      if (p.x >= minx && p.x <= maxx && p.y >= miny && p.y <= maxy && !mask[i]) {
+        mask[i] = 1
+        this.selectionIndices.push(i)
+      }
     }
     this._afterMaskChange()
   }
@@ -1234,7 +1630,10 @@ export class PointCloudViewer {
       if (p.z < -1 || p.z > 1) continue
       const dx = p.x - cx
       const dy = p.y - cy
-      if (dx * dx + dy * dy <= r2) mask[i] = 1
+      if (dx * dx + dy * dy <= r2 && !mask[i]) {
+        mask[i] = 1
+        this.selectionIndices.push(i)
+      }
     }
     this._afterMaskChange()
   }
@@ -1250,7 +1649,10 @@ export class PointCloudViewer {
     for (let i = 0; i < n; i++) {
       const p = this._projectToScreen(pos, i, W, H)
       if (p.z < -1 || p.z > 1) continue
-      if (pointInPolygon(p.x, p.y, points)) mask[i] = 1
+      if (pointInPolygon(p.x, p.y, points) && !mask[i]) {
+        mask[i] = 1
+        this.selectionIndices.push(i)
+      }
     }
     this._afterMaskChange()
   }
@@ -1258,6 +1660,7 @@ export class PointCloudViewer {
   /** 清空待提交的选中（不影响已生成的标签） */
   clearSelection() {
     this.selectionMask = null
+    this.selectionIndices = []
     this.selectionCount = 0
     this._paintColors()
     this.callbacks.onSelection?.(0)
@@ -1273,20 +1676,50 @@ export class PointCloudViewer {
     if (!cloud.labelHistory) cloud.labelHistory = []
   }
 
+  /** 共享真值模板第一次被编辑时复制为当前帧私有数据 */
+  _ensureWritableLabels(cloud) {
+    if (!cloud) return
+    if (!cloud._labelsShared) {
+      this._ensureSegmentStructures(cloud)
+      return
+    }
+    cloud.pointLabels = Int32Array.from(cloud.pointLabels || [])
+    cloud.pointSegment = Int32Array.from(cloud.pointSegment || [])
+    cloud.segments = (cloud.segments || []).map((s) => ({
+      id: s.id,
+      classId: s.classId,
+      indices: Int32Array.from(s.indices),
+    }))
+    cloud.labelHistory = []
+    cloud._labelsShared = false
+    cloud._labelsTemplateUrl = null
+  }
+
   /**
    * 把已保存的标签挂到新加载的点云上（点云缓存被淘汰后重新加载也能恢复标注）
    */
   _attachSavedLabels(cloud) {
     const saved = this.labelsByKey.get(cloud.key)
-    cloud.pointLabels = saved ? saved.pointLabels : null
-    cloud.pointSegment = saved ? saved.pointSegment : null
-    cloud.segments = saved ? saved.segments : null
-    cloud.labelHistory = saved ? saved.labelHistory : null
+    if (saved) {
+      cloud.pointLabels = saved.pointLabels
+      cloud.pointSegment = saved.pointSegment
+      cloud.segments = saved.segments
+      cloud.labelHistory = saved.labelHistory
+      cloud._labelsShared = false
+      return
+    }
+    // 模板由 _loadPointLabels 挂载；这里不要清空已挂载的共享数组
+    if (cloud._labelsShared && cloud.pointLabels) return
+    cloud.pointLabels = null
+    cloud.pointSegment = null
+    cloud.segments = null
+    cloud.labelHistory = null
+    cloud._labelsShared = false
   }
 
-  /** 把当前标签写回按帧保存的缓存（引用共享，LRU 淘汰点云后标签仍在） */
+  /** 把已编辑帧的标签写回缓存（共享真值模板不入缓存） */
   _persistLabels(cloud = this.currentCloud) {
-    if (!cloud || !cloud.key) return
+    if (!cloud || !cloud.key || cloud._labelsShared) return
     // 重新插入以更新 LRU 顺序
     this.labelsByKey.delete(cloud.key)
     this.labelsByKey.set(cloud.key, {
@@ -1322,17 +1755,12 @@ export class PointCloudViewer {
     }
   }
 
-  /** 记录一次可撤销快照 */
-  _pushHistory() {
-    const cloud = this.currentCloud
+  /** 记录一条操作级撤销记录（只保存变化点，避免整帧快照占用大量内存） */
+  _pushAction(cloud, action) {
     if (!cloud) return
     this._ensureSegmentStructures(cloud)
-    cloud.labelHistory.push({
-      labels: cloud.pointLabels.slice(),
-      pointSegment: cloud.pointSegment.slice(),
-      segments: cloud.segments.map((s) => ({ id: s.id, classId: s.classId, indices: s.indices })),
-    })
-    if (cloud.labelHistory.length > 30) cloud.labelHistory.shift()
+    cloud.labelHistory.push(action)
+    if (cloud.labelHistory.length > 40) cloud.labelHistory.shift()
   }
 
   /**
@@ -1343,7 +1771,7 @@ export class PointCloudViewer {
     const cloud = this.currentCloud
     const mask = this.selectionMask
     if (!cloud || !mask) return 0
-    this._ensureSegmentStructures(cloud)
+    this._ensureWritableLabels(cloud)
     const indices = []
     const skipExisting = !this.segOverwrite
     for (let i = 0; i < mask.length; i++) {
@@ -1353,13 +1781,26 @@ export class PointCloudViewer {
       indices.push(i)
     }
     if (!indices.length) return 0
-    this._pushHistory()
     const id = ++this.segmentSeq
+    const oldLabels = new Int32Array(indices.length)
+    const oldSegments = new Int32Array(indices.length)
+    for (let k = 0; k < indices.length; k++) {
+      const i = indices[k]
+      oldLabels[k] = cloud.pointLabels[i]
+      oldSegments[k] = cloud.pointSegment[i]
+    }
     cloud.segments.push({ id, classId, indices: Int32Array.from(indices) })
     for (const i of indices) {
       cloud.pointLabels[i] = classId
       cloud.pointSegment[i] = id
     }
+    this._pushAction(cloud, {
+      kind: 'commit',
+      segId: id,
+      indices: Int32Array.from(indices),
+      oldLabels,
+      oldSegments,
+    })
     // 自动切到标签着色，使点显示为类别颜色
     this.colorMode = 'label'
     this.refreshColors()
@@ -1443,13 +1884,17 @@ export class PointCloudViewer {
   /** 修改选中片段的类别 */
   setSelectedSegmentClass(classId) {
     const cloud = this.currentCloud
-    const seg = cloud?.segments?.find((s) => s.id === this.selectedSegmentId)
+    if (!cloud) return 0
+    this._ensureWritableLabels(cloud)
+    const seg = cloud.segments.find((s) => s.id === this.selectedSegmentId)
     if (!seg) return 0
-    this._pushHistory()
+    const oldClass = seg.classId
+    const indices = Int32Array.from(seg.indices)
     seg.classId = classId
-    for (const i of seg.indices) {
+    for (const i of indices) {
       if (cloud.pointSegment[i] === seg.id) cloud.pointLabels[i] = classId
     }
+    this._pushAction(cloud, { kind: 'class', segId: seg.id, oldClass, indices })
     this.refreshColors()
     this._persistLabels(cloud)
     this.callbacks.onSegmentSelect?.(this.getSelectedSegment())
@@ -1459,45 +1904,83 @@ export class PointCloudViewer {
   /** 删除选中片段（其点回到未标注） */
   deleteSelectedSegment() {
     const cloud = this.currentCloud
-    const seg = cloud?.segments?.find((s) => s.id === this.selectedSegmentId)
+    if (!cloud) return 0
+    this._ensureWritableLabels(cloud)
+    const seg = cloud.segments.find((s) => s.id === this.selectedSegmentId)
     if (!seg) return 0
-    this._pushHistory()
-    let count = 0
+    const indices = []
+    const labels = []
     for (const i of seg.indices) {
       if (cloud.pointSegment[i] === seg.id) {
+        indices.push(i)
+        labels.push(seg.classId)
         cloud.pointLabels[i] = -1
         cloud.pointSegment[i] = -1
-        count++
       }
     }
     cloud.segments = cloud.segments.filter((s) => s.id !== seg.id)
+    this._pushAction(cloud, {
+      kind: 'delete',
+      segment: { id: seg.id, classId: seg.classId, indices: Int32Array.from(seg.indices) },
+      indices: Int32Array.from(indices),
+      labels: Int32Array.from(labels),
+    })
     this.selectedSegmentId = null
     this.refreshColors()
     this._persistLabels(cloud)
     this.callbacks.onSegmentSelect?.(null)
-    return count
+    return indices.length
   }
 
-  /** 从快照恢复标签数据 */
-  _restoreSnapshot(snap) {
-    const cloud = this.currentCloud
-    if (!cloud || !snap) return
-    cloud.pointLabels = snap.labels ? snap.labels.slice() : new Int32Array(cloud.pointCount).fill(-1)
-    cloud.pointSegment = snap.pointSegment
-      ? snap.pointSegment.slice()
-      : new Int32Array(cloud.pointCount).fill(-1)
-    cloud.segments = (snap.segments || []).map((s) => ({ ...s }))
-    this.selectedSegmentId = null
-    this.refreshColors()
-    this._persistLabels(cloud)
-    this.callbacks.onSegmentSelect?.(null)
-  }
-
-  /** 撤销上一步标签操作 */
+  /** 撤销上一步标签操作（操作级差分，不保存整帧快照） */
   undoLabel() {
     const cloud = this.currentCloud
     if (!cloud || !cloud.labelHistory || !cloud.labelHistory.length) return false
-    this._restoreSnapshot(cloud.labelHistory.pop())
+    this._ensureWritableLabels(cloud)
+    const action = cloud.labelHistory.pop()
+    if (!action) return false
+    if (action.kind === 'commit') {
+      cloud.segments = cloud.segments.filter((s) => s.id !== action.segId)
+      for (let k = 0; k < action.indices.length; k++) {
+        const i = action.indices[k]
+        cloud.pointLabels[i] = action.oldLabels[k]
+        cloud.pointSegment[i] = action.oldSegments[k]
+      }
+      if (this.selectedSegmentId === action.segId) this.selectedSegmentId = null
+    } else if (action.kind === 'class') {
+      const seg = cloud.segments.find((s) => s.id === action.segId)
+      if (seg) {
+        seg.classId = action.oldClass
+        for (const i of action.indices) {
+          if (cloud.pointSegment[i] === seg.id) cloud.pointLabels[i] = action.oldClass
+        }
+      }
+    } else if (action.kind === 'delete') {
+      if (!cloud.segments.some((s) => s.id === action.segment.id)) {
+        cloud.segments.push({
+          id: action.segment.id,
+          classId: action.segment.classId,
+          indices: Int32Array.from(action.segment.indices),
+        })
+      }
+      for (let k = 0; k < action.indices.length; k++) {
+        const i = action.indices[k]
+        cloud.pointLabels[i] = action.labels[k]
+        cloud.pointSegment[i] = action.segment.id
+      }
+    } else if (action.kind === 'clear') {
+      cloud.pointLabels = Int32Array.from(action.labels)
+      cloud.pointSegment = Int32Array.from(action.pointSegment)
+      cloud.segments = (action.segments || []).map((s) => ({
+        id: s.id,
+        classId: s.classId,
+        indices: Int32Array.from(s.indices),
+      }))
+      this.selectedSegmentId = null
+    }
+    this.refreshColors()
+    this._persistLabels(cloud)
+    this.callbacks.onSegmentSelect?.(this.getSelectedSegment())
     return true
   }
 
@@ -1505,7 +1988,17 @@ export class PointCloudViewer {
   clearLabels() {
     const cloud = this.currentCloud
     if (!cloud || !cloud.pointSegment) return
-    this._pushHistory()
+    this._ensureWritableLabels(cloud)
+    this._pushAction(cloud, {
+      kind: 'clear',
+      labels: Int32Array.from(cloud.pointLabels),
+      pointSegment: Int32Array.from(cloud.pointSegment),
+      segments: (cloud.segments || []).map((s) => ({
+        id: s.id,
+        classId: s.classId,
+        indices: Int32Array.from(s.indices),
+      })),
+    })
     cloud.pointLabels = new Int32Array(cloud.pointCount).fill(-1)
     cloud.pointSegment = new Int32Array(cloud.pointCount).fill(-1)
     cloud.segments = []
@@ -1540,6 +2033,7 @@ export class PointCloudViewer {
   /** 释放所有 GPU 资源与事件监听 */
   dispose() {
     this.running = false
+    this.clearPrefetch()
     this.renderer.setAnimationLoop(null)
     this.resizeObserver.disconnect()
     this.renderer.domElement.removeEventListener('pointerdown', this._onPointerDown)
@@ -1557,6 +2051,9 @@ export class PointCloudViewer {
     this.vertexGeo.dispose()
     if (this._drawPreview) disposeObject(this._drawPreview)
     this.labelsByKey.clear()
+    this.pointLabelTemplates.clear()
+    this.pointLabelFiles.clear()
+    this.pointLabelFailed.clear()
     this.scaleHandleGeo.dispose()
     for (const h of this.scaleHandles) h.material.dispose()
     if (this.pointGeometry) this.pointGeometry.dispose()
@@ -1571,6 +2068,28 @@ export class PointCloudViewer {
 }
 
 /** 递归释放一个 Object3D 子树中的几何体与材质 */
+function withTimeout(promise, ms, message) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(message)), ms)
+    promise.then(
+      (value) => {
+        clearTimeout(timer)
+        resolve(value)
+      },
+      (err) => {
+        clearTimeout(timer)
+        reject(err)
+      },
+    )
+  })
+}
+
+function toIdSet(value) {
+  if (value instanceof Set) return value
+  if (Array.isArray(value)) return new Set(value)
+  return new Set(value ? [value] : [])
+}
+
 function disposeObject(root) {
   root.traverse((node) => {
     if (node.geometry) node.geometry.dispose()

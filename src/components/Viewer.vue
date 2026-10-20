@@ -13,8 +13,12 @@ import {
   currentFrame,
   currentObjects,
   selectedObject,
+  selectedObjects,
   selectObject,
   updateObject,
+  translateObjects,
+  rotatePolyline,
+  markingCentroid,
   loadLocalFiles,
   addPolyline,
   setPolylinePoint,
@@ -25,18 +29,53 @@ import {
 const viewportEl = ref(null)
 const sketchEl = ref(null) // 分割框选的可视化覆盖层（不接收鼠标事件）
 const dragging = ref(false)
+const perfEnabled = new URLSearchParams(location.search).has('perf')
+const perfText = ref('')
+let perfTimer = null
 
 let viewer = null
 let loadToken = 0 // 用于丢弃过期的异步加载结果（快速切帧时）
+let loadAbort = null // 取消上一次尚未完成的帧请求
+let loadKey = null // 当前正在加载的帧缓存键（避免同帧重复加载被自己取消）
 let fitPending = true // 新数据集加载后是否需要自动适应视角
 let currentSketch = null
+let loadingTimer = null
+let syncRaf = 0
+
+/** 开始加载：延迟 150ms 再显示遮罩，避免缓存命中时闪烁 */
+function beginLoading(token) {
+  if (loadingTimer) clearTimeout(loadingTimer)
+  loadingTimer = setTimeout(() => {
+    loadingTimer = null
+    if (token === loadToken && state.loading) state.loadingVisible = true
+  }, 150)
+}
+
+/** 结束加载：点云一上屏就调用，不等待标注同步 */
+function finishLoading() {
+  if (loadingTimer) {
+    clearTimeout(loadingTimer)
+    loadingTimer = null
+  }
+  state.loading = false
+  state.loadingVisible = false
+}
+
+/** 合并多次同步请求，避免切帧/GT 导入时同一 tick 全量同步多次 */
+function scheduleSyncBoxes() {
+  if (!viewer || state.loading || syncRaf) return
+  syncRaf = requestAnimationFrame(() => {
+    syncRaf = 0
+    syncBoxes()
+  })
+}
 
 /** 把当前帧对象（3D 框 + 标线）同步到视口，并刷新编辑手柄 */
 function syncBoxes() {
   if (!viewer) return
   const boxObjects = currentObjects.value.filter((o) => o.shape !== 'line' && o.shape !== 'arrow')
-  viewer.syncBoxes(boxObjects, state.classes, state.selectedObjectId)
-  viewer.syncMarks(currentObjects.value, state.classes, state.selectedObjectId)
+  viewer.syncBoxes(boxObjects, state.classes, state.selectedObjectIds)
+  viewer.syncMarks(currentObjects.value, state.classes, state.selectedObjectIds)
   applyGizmo()
 }
 
@@ -66,9 +105,21 @@ function onDrawFinish(draft) {
 /** 仅当选中对象且工具为变换类时才挂载手柄 */
 function applyGizmo() {
   if (!viewer) return
+  const objects = selectedObjects.value
+  if (objects.length > 1) {
+    // 多选只支持整体平移；旋转/缩放请单个编辑
+    if (state.tool === 'translate') viewer.attachGroupGizmo(objects.map((o) => o.id))
+    else viewer.attachGizmo(null)
+    return
+  }
   const transformTools = ['translate', 'rotate', 'scale']
   const obj = selectedObject.value
   const isMark = obj?.shape === 'line' || obj?.shape === 'arrow'
+  // 单条线/箭头：移动/旋转工具显示整体手柄（顶点手柄仍可单独拖拽）
+  if (obj && isMark && (state.tool === 'translate' || state.tool === 'rotate')) {
+    viewer.attachGroupGizmo([obj.id], state.tool, markingCentroid(obj))
+    return
+  }
   if (obj && !isMark && transformTools.includes(state.tool)) viewer.attachGizmo(obj.id)
   else viewer.attachGizmo(null)
 }
@@ -78,23 +129,42 @@ async function loadCurrent() {
   const frame = currentFrame.value
   if (!viewer) return
   if (!frame) {
-    // 无数据：清空点云显示
+    // 无数据：清空点云显示并终止进行中的加载
+    loadToken++
+    loadAbort?.abort()
+    loadAbort = null
+    loadKey = null
+    finishLoading()
     if (viewer.pointObject) {
       viewer.scene.remove(viewer.pointObject)
+      viewer.pointGeometry?.dispose()
       viewer.pointObject = null
       viewer.pointGeometry = null
       viewer.currentCloud = null
     }
     return
   }
+  const key = viewer.cacheKeyFor(frame)
+  // 数据加载完成时 currentIndex/dataset 两个 watcher 可能同时触发；同帧只保留一个请求
+  if (state.loading && loadKey === key) return
+  if (loadKey !== key) {
+    loadAbort?.abort()
+    viewer.clearPrefetch() // 切帧时丢弃旧预取，避免后台任务影响当前帧
+  }
+  loadKey = key
   const token = ++loadToken
+  const controller = new AbortController()
+  loadAbort = controller
   state.loading = true
   state.error = ''
+  beginLoading(token)
   try {
     // 先把着色模式设好，showFrame 构建几何体时即可直接按该模式着色（避免加载后再全量重算一次）
     viewer.presetColorMode(state.colorMode)
-    await viewer.showFrame(frame)
+    await viewer.showFrame(frame, { signal: controller.signal })
     if (token !== loadToken) return // 已有更新的加载请求，丢弃本次
+    // 点云已经可见：先结束“加载点云”，标注同步在遮罩外完成
+    finishLoading()
     viewer.setPointSize(state.pointSize)
     if (fitPending) {
       // 数据集自带相机则用它，否则按包围球自适应
@@ -103,10 +173,11 @@ async function loadCurrent() {
       fitPending = false
     }
     syncBoxes()
+    viewer.prefetchFrames(state.frames, state.currentIndex)
   } catch (err) {
-    if (token === loadToken) state.error = err?.message || String(err)
+    if (token === loadToken && !err?.canceled) state.error = err?.message || String(err)
   } finally {
-    if (token === loadToken) state.loading = false
+    if (token === loadToken) finishLoading()
   }
 }
 
@@ -168,8 +239,16 @@ function onDrop(event) {
 
 onMounted(() => {
   viewer = new PointCloudViewer(viewportEl.value, {
-    onSelect: (id) => selectObject(id), // 视口点选 3D 框
+    onSelect: (id, options) => selectObject(id, options), // 视口点选 3D 框（支持 Ctrl 多选）
     onBoxChange: (id, transform) => updateObject(id, transform), // gizmo 拖动回写
+    onGroupCommit: (ids, delta) => {
+      translateObjects(ids, delta)
+      syncBoxes()
+    },
+    onGroupRotate: (id, angle) => {
+      rotatePolyline(id, angle)
+      syncBoxes()
+    },
     onSketch,
     onSelection: (count) => {
       state.selectionCount = count
@@ -186,6 +265,10 @@ onMounted(() => {
       state.selectedSegment = segment
       if (segment) state.colorMode = 'label'
     },
+    // 点标签后台加载完成后刷新分割统计
+    onLabelsLoaded: () => {
+      state.labelVersion++
+    },
     getClasses: () => state.classes, // 供标签着色使用
     getActiveClassId: () => state.activeClassId, // 自动赋标签所用类别
     // 标线绘制
@@ -196,13 +279,21 @@ onMounted(() => {
     onVertexChange: (objId, index, point, pathIndex) => {
       setPolylinePoint(objId, index, point, pathIndex)
       // 拖动过程中也实时刷新标线几何（顶点手柄保持不重建）
-      syncBoxes()
+      scheduleSyncBoxes()
     },
     onVertexDelete: (objId, index, pathIndex) => {
       deletePolylinePoint(objId, index, pathIndex)
     },
   })
   viewerRef.current = viewer
+  viewer.setSnapEnabled(state.snapToPoints)
+  if (perfEnabled) {
+    perfTimer = setInterval(() => {
+      const p = viewer?.getPerfStats?.()
+      if (!p) return
+      perfText.value = `${p.fps} FPS · ${p.frameMs}ms · draw ${p.calls} · ${(p.points / 1000).toFixed(0)}k pts`
+    }, 500)
+  }
   loadCurrent()
 })
 
@@ -214,26 +305,27 @@ watch(
   () => state.datasetName + '#' + state.frames.length,
   () => {
     fitPending = true
+    viewer?.clearPrefetch()
     loadCurrent()
   },
 )
 
 watch(
-  // 对象增删改（含 gizmo 拖动）后同步框
+  // 对象增删改（含 gizmo 拖动）后同步框；rAF 合并，且加载点云期间跳过
   () => currentObjects.value,
-  () => syncBoxes(),
+  () => scheduleSyncBoxes(),
   { deep: true },
 )
 
 watch(
-  () => [state.selectedObjectId, state.tool],
+  () => [state.selectedObjectIds.join('|'), state.selectedObjectId, state.tool],
   () => {
     if (!viewer) return
     viewer.setGizmoMode(state.tool)
     viewer.setDrawMode(state.tool === 'line' || state.tool === 'arrow' ? state.tool : null)
     applyDrawOptions()
     // 选中变化也要刷新标线顶点手柄（syncBoxes 内部会调用 applyGizmo）
-    syncBoxes()
+    scheduleSyncBoxes()
   },
 )
 
@@ -252,6 +344,7 @@ watch(() => state.segEnabled, (on) => {
 watch(() => state.segMode, (mode) => viewer?.setSegMode(mode))
 watch(() => state.segOverwrite, (v) => viewer?.setSegOverwrite(v))
 watch(() => state.brushSize, (size) => viewer?.setBrushSize(size))
+watch(() => state.snapToPoints, (on) => viewer?.setSnapEnabled(on))
 
 // 切帧/换数据集后清空覆盖层
 watch(
@@ -260,6 +353,15 @@ watch(
 )
 
 onBeforeUnmount(() => {
+  loadToken++
+  loadAbort?.abort()
+  loadAbort = null
+  if (loadingTimer) clearTimeout(loadingTimer)
+  loadingTimer = null
+  if (syncRaf) cancelAnimationFrame(syncRaf)
+  syncRaf = 0
+  if (perfTimer) clearInterval(perfTimer)
+  perfTimer = null
   viewer?.dispose()
   viewerRef.current = null
   viewer = null
@@ -271,7 +373,7 @@ onBeforeUnmount(() => {
     ref="viewportEl"
     class="viewport"
     :class="{ 'is-drawing': state.tool === 'line' || state.tool === 'arrow' }"
-    v-loading="state.loading"
+    v-loading="state.loadingVisible"
     element-loading-text="加载点云…"
     element-loading-background="rgba(13, 17, 23, 0.55)"
     @dragover.prevent="dragging = true"
@@ -280,7 +382,8 @@ onBeforeUnmount(() => {
   >
     <!-- 分割框选可视化层：pointer-events 由样式置为 none，不拦截视口交互 -->
     <canvas ref="sketchEl" class="sketch"></canvas>
-    <div v-if="!state.loading && !state.frames.length" class="overlay">
+    <div v-if="perfEnabled" class="perf-overlay">{{ perfText }}</div>
+    <div v-if="!state.loadingVisible && !state.frames.length" class="overlay">
       <div class="badge">拖入 .pcd / .ply / .bin / .las 文件，或从工具栏加载示例数据</div>
     </div>
     <div v-if="dragging" class="drop-target">松开以加载点云</div>

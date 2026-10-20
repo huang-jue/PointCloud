@@ -29,6 +29,8 @@ function start() {
     return
   }
   timer = setInterval(() => {
+    // 当前帧尚未加载完时先不推进，避免连续取消请求造成闪烁
+    if (state.loading) return
     const next = state.currentIndex + 1
     store.setCurrentIndex(next >= state.frames.length ? 0 : next)
   }, Math.max(50, 1000 / fps.value))

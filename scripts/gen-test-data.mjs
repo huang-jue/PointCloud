@@ -774,6 +774,7 @@ async function generateScene(profile, args, outRoot, classOf) {
   const markings = buildMarkings(profile, groundZ)
   const rng = mulberry32(profile.seed)
   const meta = []
+  const allFrames = []
   for (let i = 0; i < frames; i++) {
     const id = String(i).padStart(6, '0')
     const { positions, intensities, objects } = buildFrame(eff, i, rng, classOf, markings)
@@ -781,6 +782,12 @@ async function generateScene(profile, args, outRoot, classOf) {
     if (formats.includes('pcd')) await writeFile(join(sceneDir, `frame_${id}.pcd`), toPcdBinary(positions, intensities))
     if (formats.includes('ply')) await writeFile(join(sceneDir, `frame_${id}.ply`), toPlyBinary(positions, intensities))
     await writeFile(join(sceneDir, 'labels', `frame_${id}.json`), JSON.stringify(objects, null, 2))
+    const frameName = formats.includes('bin')
+      ? `frame_${id}.bin`
+      : formats.includes('pcd')
+        ? `frame_${id}.pcd`
+        : `frame_${id}.ply`
+    allFrames.push({ name: frameName, objects })
     meta.push({
       index: i,
       timestamp: Number((i * profile.dt).toFixed(3)),
@@ -792,6 +799,12 @@ async function generateScene(profile, args, outRoot, classOf) {
       points: intensities.length,
     })
   }
+
+  // 全量真值：一次请求导入所有帧，避免演示时逐帧拉取
+  await writeFile(
+    join(sceneDir, 'labels', 'all.json'),
+    JSON.stringify({ format: 'pointcloud-groundtruth', version: 1, frames: allFrames }),
+  )
 
   // 标线点级标签：所有帧的标线点排在最前且数量一致，因此可共用一份索引文件
   if (markings.segments.length) {
@@ -811,6 +824,7 @@ async function generateScene(profile, args, outRoot, classOf) {
     dt: profile.dt,
     classes: CLASSES,
     camera: profile.camera,
+    groundTruth: 'labels/all.json',
     frames: meta,
   }
   await writeFile(join(sceneDir, 'scene.json'), JSON.stringify(scene, null, 2))

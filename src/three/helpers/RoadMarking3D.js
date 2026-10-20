@@ -25,8 +25,9 @@ export class RoadMarking3D {
 
     this.material = new THREE.MeshBasicMaterial({
       color,
-      transparent: true,
-      opacity: 0.95,
+      // 几何体在转弯处会有重叠三角形；使用不透明材质避免重叠区域颜色变深
+      transparent: false,
+      opacity: 1,
       side: THREE.DoubleSide,
       depthWrite: false,
       polygonOffset: true,
@@ -137,34 +138,50 @@ export function buildMarkingGeometry(paths, width, withHead = true) {
   const positions = []
   const indices = []
   const half = Math.max(0.01, (width || 0.15) / 2)
+  const JOIN_SEGMENTS = 10
 
   for (const raw of paths) {
     const pts = dedupe(raw)
     if (pts.length < 2) continue
 
-    // 每个顶点的法向：取前后段方向的平均
-    const normals = []
-    for (let i = 0; i < pts.length; i++) {
-      const prev = pts[Math.max(0, i - 1)]
-      const next = pts[Math.min(pts.length - 1, i + 1)]
-      let dx = next[0] - prev[0]
-      let dy = next[1] - prev[1]
-      const len = Math.hypot(dx, dy) || 1
+    // 每段独立生成一个矩形，拐角处额外补一个圆形接头。
+    // 这样不会因为内外法向偏移不同而出现转弯处变细、重叠或自交。
+    for (let i = 0; i < pts.length - 1; i++) {
+      const a = pts[i]
+      const b = pts[i + 1]
+      let dx = b[0] - a[0]
+      let dy = b[1] - a[1]
+      const len = Math.hypot(dx, dy)
+      if (len < 1e-6) continue
       dx /= len
       dy /= len
-      normals.push([-dy, dx])
+      const nx = -dy * half
+      const ny = dx * half
+      const z0 = a[2] || 0
+      const z1 = b[2] || 0
+      const base = positions.length / 3
+      positions.push(
+        a[0] + nx, a[1] + ny, z0,
+        a[0] - nx, a[1] - ny, z0,
+        b[0] + nx, b[1] + ny, z1,
+        b[0] - nx, b[1] - ny, z1,
+      )
+      indices.push(base, base + 1, base + 2, base + 1, base + 3, base + 2)
     }
 
-    const base = positions.length / 3
-    for (let i = 0; i < pts.length; i++) {
-      const [x, y, z] = pts[i]
-      const [nx, ny] = normals[i]
-      positions.push(x + nx * half, y + ny * half, z || 0)
-      positions.push(x - nx * half, y - ny * half, z || 0)
-    }
-    for (let i = 0; i < pts.length - 1; i++) {
-      const a = base + i * 2
-      indices.push(a, a + 1, a + 2, a + 1, a + 3, a + 2)
+    // 拐角圆接头（半径 = 线宽/2），保证任意夹角下线宽一致
+    for (let i = 1; i < pts.length - 1; i++) {
+      const [x, y, z = 0] = pts[i]
+      const center = positions.length / 3
+      positions.push(x, y, z)
+      const ring = positions.length / 3
+      for (let k = 0; k <= JOIN_SEGMENTS; k++) {
+        const ang = (k / JOIN_SEGMENTS) * Math.PI * 2
+        positions.push(x + Math.cos(ang) * half, y + Math.sin(ang) * half, z)
+      }
+      for (let k = 0; k < JOIN_SEGMENTS; k++) {
+        indices.push(center, ring + k, ring + k + 1)
+      }
     }
 
     // 箭头头部

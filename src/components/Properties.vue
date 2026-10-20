@@ -9,7 +9,10 @@ import { ElMessage } from 'element-plus'
 import {
   state,
   selectedObject,
+  selectedObjects,
   updateObject,
+  copySelected,
+  clearSelection,
   classColor,
   syncTrackForward,
   countTrackFrames,
@@ -23,7 +26,22 @@ import { viewerRef } from '../three/viewerRef.js'
 import { radToDeg, degToRad } from '../utils/math.js'
 import { polylineLength } from '../utils/polyline.js'
 
-const obj = selectedObject // 当前选中对象（computed ref）
+const obj = selectedObject // 单选对象（computed ref）
+const selection = selectedObjects
+const isMulti = computed(() => selection.value.length > 1)
+
+/** 多选时类别选择器显示：全部一致时显示该类别，否则显示空 */
+const commonClassId = computed(() => {
+  const list = selection.value
+  if (!list.length) return null
+  const id = list[0].classId
+  return list.every((o) => o.classId === id) ? id : null
+})
+
+function copySelection() {
+  const n = copySelected()
+  if (n) ElMessage.success(`已复制 ${n} 个对象`)
+}
 
 /** 该 trackId 出现在多少帧 */
 const trackFrames = computed(() => (obj.value?.trackId ? countTrackFrames(obj.value.trackId) : 0))
@@ -67,7 +85,7 @@ function setField(key, value) {
 }
 
 function setClass(value) {
-  if (obj.value) updateObject(obj.value.id, { classId: value })
+  for (const o of selection.value) updateObject(o.id, { classId: value })
 }
 
 /** 修改顶点坐标 */
@@ -124,8 +142,39 @@ function syncForward() {
         <span style="margin-left: 4px">居中</span>
       </el-button>
     </h3>
-    <el-empty v-if="!obj" :image-size="50" description="未选中对象" style="padding: 6px 0" />
-    <template v-else>
+    <el-empty
+      v-if="!selection.length"
+      :image-size="50"
+      description="未选中对象"
+      style="padding: 6px 0"
+    />
+    <template v-else-if="isMulti">
+      <div class="hint" style="margin-bottom: 10px">
+        已选中 <b style="color: var(--text)">{{ selection.length }}</b> 个对象
+        <span style="margin-left: 6px">按 W 可整体平移</span>
+      </div>
+      <div class="field" style="margin-bottom: 10px">
+        <label>批量修改类别</label>
+        <el-select
+          :model-value="commonClassId"
+          placeholder="多个类别"
+          style="width: 100%"
+          @change="setClass"
+        >
+          <el-option v-for="c in state.classes" :key="c.id" :label="c.name" :value="c.id">
+            <span class="obj-dot" :style="{ background: c.color, marginRight: '6px' }"></span>{{ c.name }}
+          </el-option>
+        </el-select>
+      </div>
+      <div class="row" style="margin-top: 10px">
+        <el-button size="small" @click="copySelection">复制选中</el-button>
+        <el-button size="small" @click="clearSelection">取消选择</el-button>
+      </div>
+      <div class="hint" style="margin-top: 8px">
+        多选仅支持整体平移；旋转和缩放请单个编辑。
+      </div>
+    </template>
+    <template v-else-if="obj">
       <div class="field" style="margin-bottom: 10px">
         <label>类别</label>
         <el-select :model-value="obj.classId" style="width: 100%" @change="setClass">
@@ -167,6 +216,13 @@ function syncForward() {
         <div class="row" style="margin-top: 8px">
           <el-button size="small" @click="scaleMark(1.1)">放大 10%</el-button>
           <el-button size="small" @click="scaleMark(0.9)">缩小 10%</el-button>
+        </div>
+        <div class="row" style="margin-top: 8px">
+          <el-switch v-model="state.snapToPoints" size="small" />
+          <span class="hint">拖拽顶点时吸附到最近的点云</span>
+        </div>
+        <div class="hint" style="margin-top: 6px">
+          按 W 整体平移、按 E 整体旋转；拖拽黄色顶点可单独改点，缩放使用上方按钮。
         </div>
 
         <div style="margin-top: 10px">
