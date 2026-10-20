@@ -28,4 +28,11 @@ if (import.meta.env.DEV) {
   import('./three/viewerRef.js').then((m) => {
     window.__viewer = m.viewerRef
   })
+  // 便于调试 / 自动化测试：HTTP 封装与保存模块
+  import('./utils/http.js').then((m) => {
+    window.__http = m
+  })
+  import('./utils/save.js').then((m) => {
+    window.__save = m
+  })
 }

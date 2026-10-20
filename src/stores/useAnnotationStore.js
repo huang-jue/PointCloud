@@ -18,6 +18,13 @@
  *     id, trackId, startFrame, multiFrame,
  *     classId, type, h, w, l, x, y, z, ry, score, source
  *   }
+ *   marking = {
+ *     id, shape: 'line' | 'arrow', trackId, startFrame, multiFrame,
+ *     classId, type, width, source,
+ *     points: [[x,y,z], ...]        // shape=line
+ *     paths: [[[x,y,z], ...], ...]  // shape=arrow（可多路径，如直行+左转）
+ *     template: string | null
+ *   }
  *
  * 多帧物体：`multiFrame=true` 的对象在多帧中共享同一 `trackId`，
  * 起始帧=startFrame，起始帧之前不创建（即隐藏）。
@@ -27,6 +34,14 @@ import { reactive, computed } from 'vue'
 import { uid } from '../utils/id.js'
 import { pathExt } from '../utils/math.js'
 import { objectsToKittiText, kittiTextToObjects } from '../utils/kitti.js'
+import { get } from '../utils/http.js'
+import {
+  clonePoints,
+  clonePaths,
+  polylineCentroid,
+  rotatePoints,
+  scalePoints,
+} from '../utils/polyline.js'
 
 /** 默认类别表（加载数据集时会被 scene.classes 覆盖） */
 export const DEFAULT_CLASSES = [
@@ -35,7 +50,15 @@ export const DEFAULT_CLASSES = [
   { id: 2, name: 'Pedestrian', color: '#ff6b6b' },
   { id: 3, name: 'Cyclist', color: '#ffd166' },
   { id: 4, name: 'Pole', color: '#9aa5b1' },
+  { id: 5, name: 'Truck', color: '#b07cff' },
+  { id: 6, name: 'LaneLine', color: '#f2f4f8' },
+  { id: 7, name: 'Crosswalk', color: '#ffd166' },
+  { id: 8, name: 'RoadArrow', color: '#3fd0d4' },
+  { id: 9, name: 'StopLine', color: '#ff8f3f' },
 ]
+
+/** 标线类别名（画线/画箭头时自动切换） */
+export const MARKING_CLASS = { line: 'LaneLine', arrow: 'RoadArrow' }
 
 let classSeq = 100 // 新增类别自增 id
 let trackSeq = 1000 // 多帧物体 trackId 自增（避开真值里的小整数）
@@ -60,13 +83,21 @@ export const state = reactive({
   activeClassId: 0,
 
   /* 交互与显示 */
-  tool: 'select', // select | translate | rotate | scale
+  tool: 'select', // select | translate | rotate | scale | line | arrow
   colorMode: 'intensity', // intensity | height | source | label
   pointSize: 2, // 像素单位
   playing: false, // 时间轴播放中
   multiFrame: false, // 多帧添加开关
   multiFrameMove: true, // 多帧移动开关：移动/旋转/缩放时联动后续帧
   backgroundColor: '#0d1117',
+
+  /* 标线绘制 */
+  lineWidth: 0.15, // 车道线宽（米）
+  arrowWidth: 0.35, // 箭头线宽（米）
+  arrowTemplate: 'free', // free | straight | left | right | straightLeft | uturn
+  drawHeading: 0, // 模板箭头朝向（度）
+  draftCount: 0, // 当前绘制草稿的顶点数
+  lastBoxClassId: 0, // 进入绘制前使用的框类别，退出时恢复
 
   selectedObjectId: null,
 
@@ -180,6 +211,7 @@ export function setScene(scene, baseUrl) {
       ext,
       source: { kind: 'url', ext, url: joinUrl(baseUrl, file) },
       labelUrl: f.label ? joinUrl(baseUrl, f.label) : null,
+      pointLabelsUrl: f.pointLabels ? joinUrl(baseUrl, f.pointLabels) : null,
       pointCount: f.points ?? null,
       objects: [],
       loaded: false,
@@ -195,18 +227,23 @@ let sampleIndexCache = null
 /** 读取示例数据集索引（带缓存），供工具栏下拉使用 */
 export async function listSampleDatasets() {
   if (sampleIndexCache) return sampleIndexCache
-  const res = await fetch(`${SAMPLE_BASE}/index.json`)
-  if (!res.ok) throw new Error(`示例数据集索引不可用 (HTTP ${res.status})，请先运行 npm run gen:test-data`)
-  const data = await res.json()
-  sampleIndexCache = data.datasets || []
-  return sampleIndexCache
+  try {
+    const data = await get(`${SAMPLE_BASE}/index.json`, null, { silent: true })
+    sampleIndexCache = (data && data.datasets) || []
+    return sampleIndexCache
+  } catch (err) {
+    throw new Error(`示例数据集索引不可用 (${err.message})，请先运行 npm run gen:test-data`)
+  }
 }
 
 /** 加载指定 id 的示例数据集 */
 export async function loadSampleDataset(id) {
-  const res = await fetch(`${SAMPLE_BASE}/${id}/scene.json`)
-  if (!res.ok) throw new Error(`示例数据集「${id}」不可用 (HTTP ${res.status})`)
-  const scene = await res.json()
+  let scene
+  try {
+    scene = await get(`${SAMPLE_BASE}/${id}/scene.json`, null, { silent: true })
+  } catch (err) {
+    throw new Error(`示例数据集「${id}」不可用：${err.message}`)
+  }
   setScene(scene, `${SAMPLE_BASE}/${id}`)
   return scene
 }
@@ -236,6 +273,7 @@ export function loadLocalFiles(fileList) {
       ext,
       source: { kind: 'file', ext, file },
       labelUrl: null,
+      pointLabelsUrl: null,
       pointCount: null,
       objects: [],
       loaded: false,
@@ -315,6 +353,156 @@ export function addObject(partial, options = {}) {
 }
 
 /**
+ * 新增标线（线 / 箭头）
+ * @param {object} partial
+ * @param {'line'|'arrow'} partial.shape
+ * @param {number[][]} [partial.points] 线顶点
+ * @param {number[][][]} [partial.paths] 箭头路径
+ * @param {number} [partial.width] 线宽（米）
+ * @param {object} [options] { propagate }
+ * @returns {object|null} 当前帧新建的标线
+ */
+export function addPolyline(partial, options = {}) {
+  const frame = currentFrame.value
+  if (!frame) return null
+  const shape = partial.shape === 'arrow' ? 'arrow' : 'line'
+  const clsName = partial.type || MARKING_CLASS[shape]
+  const cls = partial.classId != null ? classById(partial.classId) : classByName(clsName)
+  const propagate = options.propagate ?? state.multiFrame
+  const trackId = propagate ? nextTrackId() : (partial.trackId ?? 0)
+  const startFrame = propagate ? state.currentIndex : (partial.startFrame ?? state.currentIndex)
+  const template = {
+    shape,
+    trackId,
+    startFrame,
+    multiFrame: propagate,
+    classId: partial.classId ?? cls?.id ?? state.activeClassId,
+    type: partial.type ?? cls?.name ?? (shape === 'arrow' ? 'RoadArrow' : 'LaneLine'),
+    width: partial.width ?? (shape === 'arrow' ? state.arrowWidth : state.lineWidth),
+    source: partial.source ?? 'manual',
+  }
+  if (shape === 'line') template.points = clonePoints(partial.points)
+  else {
+    template.paths = clonePaths(partial.paths)
+    template.template = partial.template ?? null
+  }
+  const last = propagate ? state.frames.length - 1 : state.currentIndex
+  let first = null
+  for (let j = state.currentIndex; j <= last; j++) {
+    const item = { ...template, id: uid('mark') }
+    if (shape === 'line') item.points = clonePoints(template.points)
+    else item.paths = clonePaths(template.paths)
+    state.frames[j].objects.push(item)
+    if (!first) first = item
+  }
+  state.selectedObjectId = first ? first.id : null
+  return first
+}
+
+/** 判断是否为标线对象 */
+export function isMarking(obj) {
+  return !!obj && (obj.shape === 'line' || obj.shape === 'arrow')
+}
+
+/**
+ * 更新标线的单个顶点（line.points / arrow.paths[pathIndex]）
+ * @param {string} id 对象 id
+ * @param {number} index 顶点索引
+ * @param {[number,number,number]} point 新坐标
+ * @param {number} [pathIndex] 箭头路径索引（线忽略）
+ */
+export function setPolylinePoint(id, index, point, pathIndex = 0) {
+  const obj = currentObjects.value.find((o) => o.id === id)
+  if (!isMarking(obj)) return
+  const arr = obj.shape === 'line' ? obj.points : obj.paths?.[pathIndex]
+  if (!arr || index < 0 || index >= arr.length) return
+  arr[index] = [point[0], point[1], point[2] ?? arr[index][2] ?? 0]
+  propagateMarkingChange(obj, { points: obj.points, paths: obj.paths })
+}
+
+/** 删除标线的单个顶点（至少保留 2 个） */
+export function deletePolylinePoint(id, index, pathIndex = 0) {
+  const obj = currentObjects.value.find((o) => o.id === id)
+  if (!isMarking(obj)) return false
+  const arr = obj.shape === 'line' ? obj.points : obj.paths?.[pathIndex]
+  if (!arr || arr.length <= 2 || index < 0 || index >= arr.length) return false
+  arr.splice(index, 1)
+  if (obj.shape === 'line') obj.template = null
+  propagateMarkingChange(obj, { points: obj.points, paths: obj.paths })
+  return true
+}
+
+/**
+ * 绕质心旋转标线（弧度）
+ * @param {string} id
+ * @param {number} angle 弧度，正值逆时针（俯视）
+ */
+export function rotatePolyline(id, angle) {
+  const obj = currentObjects.value.find((o) => o.id === id)
+  if (!isMarking(obj)) return
+  if (obj.shape === 'line') {
+    obj.points = rotatePoints(obj.points, angle, polylineCentroid(obj.points))
+  } else {
+    const center = markingCentroid(obj)
+    obj.paths = obj.paths.map((p) => rotatePoints(p, angle, center))
+  }
+  propagateMarkingChange(obj, { points: obj.points, paths: obj.paths })
+}
+
+/** 绕质心缩放标线 */
+export function scalePolyline(id, factor) {
+  const obj = currentObjects.value.find((o) => o.id === id)
+  if (!isMarking(obj)) return
+  if (obj.shape === 'line') {
+    obj.points = scalePoints(obj.points, factor, polylineCentroid(obj.points))
+  } else {
+    const center = markingCentroid(obj)
+    obj.paths = obj.paths.map((p) => scalePoints(p, factor, center))
+  }
+  propagateMarkingChange(obj, { points: obj.points, paths: obj.paths })
+}
+
+/** 箭头所有路径合起来的质心 */
+export function markingCentroid(obj) {
+  if (!isMarking(obj)) return [0, 0, 0]
+  const all = obj.shape === 'line' ? obj.points : (obj.paths || []).flat()
+  return polylineCentroid(all)
+}
+
+/** 标线变更同步到后续帧同一 track（多帧移动开启时） */
+function propagateMarkingChange(obj, { points, paths }) {
+  if (!state.multiFrameMove || !(obj.trackId > 0)) return
+  for (let j = state.currentIndex + 1; j < state.frames.length; j++) {
+    for (const o of state.frames[j].objects) {
+      if (o.trackId !== obj.trackId || !isMarking(o)) continue
+      if (o.shape === 'line' && points) o.points = clonePoints(points)
+      if (o.shape === 'arrow' && paths) o.paths = clonePaths(paths)
+    }
+  }
+}
+
+/**
+ * 切换工具，并在进入/退出标线绘制时自动切换类别
+ *  - line  -> LaneLine
+ *  - arrow -> RoadArrow
+ *  - 退出绘制 -> 恢复进入前的框类别
+ */
+export function setTool(tool) {
+  const wasDraw = state.tool === 'line' || state.tool === 'arrow'
+  const isDraw = tool === 'line' || tool === 'arrow'
+  if (isDraw && !wasDraw) state.lastBoxClassId = state.activeClassId
+  if (!isDraw && wasDraw) state.activeClassId = state.lastBoxClassId
+  if (isDraw) {
+    const cls = classByName(MARKING_CLASS[tool])
+    if (cls) state.activeClassId = cls.id
+    state.segEnabled = false
+    state.selectedObjectId = null
+  }
+  state.tool = tool
+  if (!isDraw) state.draftCount = 0
+}
+
+/**
  * 更新当前帧某个对象（改类别时同步 type 名称）
  * 若开启「多帧移动」且该对象属于某条 track，则把本次的**增量**同步到之后所有帧的
  * 同一 track 对象上（保持各帧之间的相对运动不被抹平）。
@@ -330,6 +518,22 @@ export function updateObject(id, patch) {
   if (patch.classId !== undefined) {
     const c = classById(patch.classId)
     if (c) obj.type = c.name
+  }
+
+  if (isMarking(obj)) {
+    // 标线的几何由顶点描述，走 setPolylinePoint 等专用接口；
+    // 这里只同步类别/线宽等标量字段
+    if (state.multiFrameMove && obj.trackId > 0) {
+      for (let j = state.currentIndex + 1; j < state.frames.length; j++) {
+        for (const o of state.frames[j].objects) {
+          if (o.trackId !== obj.trackId || !isMarking(o)) continue
+          if (patch.classId !== undefined) o.classId = obj.classId
+          if (patch.type !== undefined) o.type = obj.type
+          if (patch.width !== undefined) o.width = obj.width
+        }
+      }
+    }
+    return
   }
 
   if (state.multiFrameMove && obj.trackId > 0) {
@@ -400,24 +604,37 @@ export function countTrackFrames(trackId) {
 export function syncTrackForward(id) {
   const obj = currentObjects.value.find((o) => o.id === id)
   if (!obj || !obj.trackId) return 0
-  const props = {
-    classId: obj.classId,
-    type: obj.type,
-    h: obj.h,
-    w: obj.w,
-    l: obj.l,
-    x: obj.x,
-    y: obj.y,
-    z: obj.z,
-    ry: obj.ry,
-  }
+  const props = isMarking(obj)
+    ? {
+        classId: obj.classId,
+        type: obj.type,
+        width: obj.width,
+        ...(obj.shape === 'line'
+          ? { points: clonePoints(obj.points), template: null }
+          : { paths: clonePaths(obj.paths), template: obj.template }),
+      }
+    : {
+        classId: obj.classId,
+        type: obj.type,
+        h: obj.h,
+        w: obj.w,
+        l: obj.l,
+        x: obj.x,
+        y: obj.y,
+        z: obj.z,
+        ry: obj.ry,
+      }
   let count = 0
   for (let j = state.currentIndex + 1; j < state.frames.length; j++) {
     for (const o of state.frames[j].objects) {
-      if (o.trackId === obj.trackId) {
-        Object.assign(o, props)
-        count++
+      if (o.trackId !== obj.trackId) continue
+      Object.assign(o, props)
+      if (isMarking(o)) {
+        // 深拷贝，避免后续帧共享同一顶点数组
+        if (o.shape === 'line' && props.points) o.points = clonePoints(props.points)
+        if (o.shape === 'arrow' && props.paths) o.paths = clonePaths(props.paths)
       }
+      count++
     }
   }
   return count
@@ -464,6 +681,14 @@ export function removeClass(id) {
 
 /* ---------------- 导入 / 导出 ---------------- */
 
+/** 对象深拷贝（标线的顶点数组需要复制，避免导出后与运行时共享引用） */
+function cloneObject(o) {
+  const copy = { ...o }
+  if (o.shape === 'line') copy.points = clonePoints(o.points)
+  if (o.shape === 'arrow') copy.paths = clonePaths(o.paths)
+  return copy
+}
+
 /** 序列化为项目标注 JSON（含全部帧对象与类别） */
 export function serializeProject() {
   return {
@@ -476,7 +701,7 @@ export function serializeProject() {
       index: f.index,
       name: f.name,
       timestamp: f.timestamp,
-      objects: f.objects.map((o) => ({ ...o })),
+      objects: f.objects.map(cloneObject),
     })),
   }
 }
@@ -501,32 +726,60 @@ export function applyProject(data, { merge = true } = {}) {
   state.frames.forEach((frame, i) => {
     const incoming = byName.get(frame.name) || (positional ? data.frames[i] : null)
     if (!incoming || !Array.isArray(incoming.objects)) return
-    const objects = incoming.objects.map((o) => ({
-      id: o.id || uid('obj'),
-      trackId: o.trackId ?? 0,
-      startFrame: o.startFrame ?? frame.index,
-      classId: o.classId ?? ensureClass(o.type || 'Object'),
-      type: o.type || 'Object',
-      h: o.h,
-      w: o.w,
-      l: o.l,
-      x: o.x,
-      y: o.y,
-      z: o.z,
-      ry: o.ry,
-      score: o.score ?? 1,
-      bbox2d: o.bbox2d,
-      source: o.source || 'import',
-    }))
+    const objects = incoming.objects.map((o) => {
+      const classId = o.classId ?? ensureClass(o.type || 'Object')
+      if (o.shape === 'line' || o.shape === 'arrow') {
+        const item = {
+          id: o.id || uid('mark'),
+          shape: o.shape,
+          trackId: o.trackId ?? 0,
+          startFrame: o.startFrame ?? frame.index,
+          multiFrame: !!o.multiFrame,
+          classId,
+          type: o.type || (o.shape === 'arrow' ? 'RoadArrow' : 'LaneLine'),
+          width: o.width ?? (o.shape === 'arrow' ? 0.35 : 0.15),
+          source: o.source || 'import',
+        }
+        if (o.shape === 'line') item.points = clonePoints(o.points)
+        else {
+          item.paths = clonePaths(o.paths)
+          item.template = o.template ?? null
+        }
+        return item
+      }
+      return {
+        id: o.id || uid('obj'),
+        trackId: o.trackId ?? 0,
+        startFrame: o.startFrame ?? frame.index,
+        classId,
+        type: o.type || 'Object',
+        h: o.h,
+        w: o.w,
+        l: o.l,
+        x: o.x,
+        y: o.y,
+        z: o.z,
+        ry: o.ry,
+        score: o.score ?? 1,
+        bbox2d: o.bbox2d,
+        source: o.source || 'import',
+      }
+    })
     if (merge) frame.objects.push(...objects)
     else frame.objects = objects
   })
 }
 
-/** 导出当前帧为 KITTI 文本（每行一个对象） */
+/** 导出当前帧为 KITTI 文本（每行一个对象；标线无法用 KITTI 表示，会被跳过） */
 export function exportCurrentKitti() {
   const frame = currentFrame.value
-  return frame ? objectsToKittiText(frame.objects) : ''
+  return frame ? objectsToKittiText(frame.objects.filter((o) => !isMarking(o))) : ''
+}
+
+/** 当前帧无法导出到 KITTI 的标线数量 */
+export function countNonKittiObjects() {
+  const frame = currentFrame.value
+  return frame ? frame.objects.filter(isMarking).length : 0
 }
 
 /** 从 KITTI 文本导入到当前帧 */
@@ -547,9 +800,7 @@ export function importKittiText(text, { merge = true } = {}) {
 export async function importGroundTruth() {
   const frame = currentFrame.value
   if (!frame?.labelUrl) throw new Error('当前帧没有真值文件')
-  const res = await fetch(frame.labelUrl)
-  if (!res.ok) throw new Error(`HTTP ${res.status}`)
-  const objects = await res.json()
+  const objects = await get(frame.labelUrl, null, { silent: true })
   applyProject({ classes: state.classes, frames: [{ name: frame.name, objects }] }, { merge: true })
   return objects.length
 }
@@ -571,6 +822,14 @@ export const store = {
   step,
   bumpLabelVersion,
   addObject,
+  addPolyline,
+  isMarking,
+  setPolylinePoint,
+  deletePolylinePoint,
+  rotatePolyline,
+  scalePolyline,
+  markingCentroid,
+  setTool,
   updateObject,
   removeObject,
   syncTrackForward,
@@ -587,7 +846,9 @@ export const store = {
   serializeProject,
   applyProject,
   exportCurrentKitti,
+  countNonKittiObjects,
   importKittiText,
   importGroundTruth,
   DEFAULT_CLASSES,
+  MARKING_CLASS,
 }

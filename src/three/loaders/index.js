@@ -17,6 +17,7 @@
 
 import { PCDLoader } from 'three/examples/jsm/loaders/PCDLoader.js'
 import { PLYLoader } from 'three/examples/jsm/loaders/PLYLoader.js'
+import { downloadBinary } from '../../utils/http.js'
 
 /** 支持的扩展名（用于文件选择框与拖拽过滤） */
 export const SUPPORTED_EXT = ['pcd', 'ply', 'bin', 'las', 'laz', 'xyz', 'csv', 'txt']
@@ -29,12 +30,11 @@ async function readSource(source) {
   if (source.kind === 'file') {
     return source.file.arrayBuffer()
   }
-  const res = await fetch(source.url)
-  if (!res.ok) throw new Error(`加载失败 HTTP ${res.status}: ${source.url}`)
+  // 走统一 HTTP 封装：得到 ArrayBuffer 与响应头
+  const { data, contentType } = await downloadBinary(source.url, { silent: true })
   // dev server / SPA 对未知路径会回退到 index.html，这里显式识别
-  const type = res.headers.get('content-type') || ''
-  if (type.includes('text/html')) throw new Error(`文件不存在或不是点云: ${source.url}`)
-  return res.arrayBuffer()
+  if (contentType.includes('text/html')) throw new Error(`文件不存在或不是点云: ${source.url}`)
+  return data
 }
 
 /**

@@ -148,6 +148,10 @@ body {
   height: 100%;
 }
 
+.viewport.is-drawing {
+  cursor: crosshair;
+}
+
 .viewport canvas.sketch {
   position: absolute;
   inset: 0;
@@ -280,6 +284,21 @@ body {
   padding: 8px;
   margin-bottom: 8px;
   background: var(--bg-2);
+}
+
+/* 标线顶点表 */
+.vertex-row {
+  display: grid;
+  grid-template-columns: 18px 1fr 1fr 1fr 20px;
+  gap: 4px;
+  align-items: center;
+  margin-bottom: 4px;
+}
+
+.vertex-idx {
+  font-size: 10px;
+  color: var(--text-dim);
+  text-align: right;
 }
 
 /* classes */

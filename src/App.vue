@@ -15,7 +15,7 @@ import SegmentPanel from './components/SegmentPanel.vue'
 import Viewer from './components/Viewer.vue'
 import Timeline from './components/Timeline.vue'
 import StatusBar from './components/StatusBar.vue'
-import { state, store, selectedObject } from './stores/useAnnotationStore.js'
+import { state, store, selectedObject, setTool } from './stores/useAnnotationStore.js'
 import { viewerRef } from './three/viewerRef.js'
 import { requestRemoveObject } from './utils/actions.js'
 
@@ -35,14 +35,39 @@ function isTyping(target) {
   return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || target?.isContentEditable
 }
 
+/** 是否处于标线绘制中 */
+function isDrawing() {
+  return state.tool === 'line' || state.tool === 'arrow'
+}
+
 function onKeydown(event) {
   if (isTyping(event.target)) return
+  // 绘制中：Enter 完成 / Esc 取消 / Backspace 退点
+  if (isDrawing()) {
+    if (event.key === 'Enter') {
+      if (!viewerRef.current?.finishDrawing()) ElMessage.warning('至少需要 2 个点才能生成标线')
+      event.preventDefault()
+      return
+    }
+    if (event.key === 'Escape') {
+      viewerRef.current?.cancelDrawing()
+      event.preventDefault()
+      return
+    }
+    if (event.key === 'Backspace') {
+      viewerRef.current?.undoDrawPoint()
+      event.preventDefault()
+      return
+    }
+  }
   // Ctrl/Cmd+Z：撤销上一步点标签
   if ((event.ctrlKey || event.metaKey) && (event.key === 'z' || event.key === 'Z')) {
     if (viewerRef.current?.undoLabel()) ElMessage.info('已撤销上一步标签')
     event.preventDefault()
     return
   }
+  // 其他组合键（Ctrl+A / Ctrl+L 等）交给浏览器/系统处理
+  if (event.ctrlKey || event.metaKey || event.altKey) return
   switch (event.key) {
     case 'ArrowLeft':
       store.step(-1)
@@ -55,23 +80,32 @@ function onKeydown(event) {
       break
     case 'w':
     case 'W':
-      state.tool = 'translate'
+      setTool('translate')
       break
     case 'e':
     case 'E':
-      state.tool = 'rotate'
+      setTool('rotate')
       break
     case 'r':
     case 'R':
-      state.tool = 'scale'
+      setTool('scale')
       break
     case 'q':
     case 'Q':
-      state.tool = 'select'
+      setTool('select')
+      break
+    case 'l':
+    case 'L':
+      setTool('line')
+      break
+    case 'a':
+    case 'A':
+      setTool('arrow')
       break
     case 'b':
     case 'B':
       state.segEnabled = !state.segEnabled
+      if (state.segEnabled) setTool('select')
       break
     case 'f':
     case 'F':

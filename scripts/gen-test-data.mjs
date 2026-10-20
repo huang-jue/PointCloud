@@ -3,7 +3,8 @@
  *
  * 生成三份数据集，输出到 public/test-data/datasets/<id>/：
  *   <id>/frame_XXXXXX.{bin,pcd,ply}   同源三种格式（bin=KITTI float32[xyz,intensity]）
- *   <id>/labels/frame_XXXXXX.json     逐帧 3D 框真值
+ *   <id>/labels/frame_XXXXXX.json     逐帧 3D 框 + 路面标线真值
+ *   <id>/point_labels/markings.json   标线点级语义标签（索引逐帧稳定）
  *   <id>/scene.json                   坐标约定、类别、相机、帧索引
  *   index.json                        数据集汇总（供前端下拉选择）
  *
@@ -17,6 +18,11 @@
 import { mkdir, writeFile, rm } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import {
+  transformTemplate,
+  sampleArrowPath,
+  sampleThickPolyline,
+} from '../src/utils/polyline.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const ROOT = resolve(__dirname, '..')
@@ -36,7 +42,17 @@ const CLASSES = [
   { id: 3, name: 'Cyclist', color: '#ffd166' },
   { id: 4, name: 'Pole', color: '#9aa5b1' },
   { id: 5, name: 'Truck', color: '#b07cff' },
+  { id: 6, name: 'LaneLine', color: '#f2f4f8' },
+  { id: 7, name: 'Crosswalk', color: '#ffd166' },
+  { id: 8, name: 'RoadArrow', color: '#3fd0d4' },
+  { id: 9, name: 'StopLine', color: '#ff8f3f' },
 ]
+
+/** 标线类别名 -> classId */
+const MARK_CLASS = { LaneLine: 6, Crosswalk: 7, RoadArrow: 8, StopLine: 9 }
+
+/** 标线采样间距（米） */
+const MARK_STEP = 0.12
 
 const DIMS = {
   Car: [4.2, 1.8, 1.5],
@@ -75,6 +91,26 @@ const SCENES = [
       { trackId: 6, type: 'Car', axis: 'x', start: 60, lateral: -2.6, speed: 12 },
     ],
     walkers: 3,
+    markings: {
+      // 沿 X 的车道线：y 为横向位置
+      lanesX: [
+        { y: 7, x0: -25, x1: 95, style: 'solid', width: 0.15, type: 'LaneLine' },
+        { y: -7, x0: -25, x1: 95, style: 'solid', width: 0.15, type: 'LaneLine' },
+        { y: 0.12, x0: -25, x1: 95, style: 'solid', width: 0.12, type: 'LaneLine' },
+        { y: -0.12, x0: -25, x1: 95, style: 'solid', width: 0.12, type: 'LaneLine' },
+        { y: 3.5, x0: -25, x1: 95, style: 'dashed', width: 0.15, dash: 4, gap: 6, type: 'LaneLine' },
+        { y: -3.5, x0: -25, x1: 95, style: 'dashed', width: 0.15, dash: 4, gap: 6, type: 'LaneLine' },
+      ],
+      arrows: [
+        { template: 'straight', x: 18, y: 5.2, heading: 0 },
+        { template: 'straightLeft', x: 18, y: 1.75, heading: 0 },
+        { template: 'left', x: 18, y: -1.75, heading: 180 },
+        { template: 'straight', x: 42, y: -5.2, heading: 180 },
+        { template: 'right', x: 42, y: 1.75, heading: 0 },
+      ],
+      crosswalks: [],
+      stopLines: [],
+    },
     camera: { position: [-34, -36, 24], target: [32, 0, 0] },
   },
   {
@@ -106,6 +142,27 @@ const SCENES = [
       { trackId: 10, type: 'Car', axis: 'x', start: 140, lateral: 4.5, speed: 23 },
     ],
     walkers: 0,
+    markings: {
+      lanesX: [
+        { y: 11, x0: -40, x1: 200, style: 'solid', width: 0.18, type: 'LaneLine' },
+        { y: -11, x0: -40, x1: 200, style: 'solid', width: 0.18, type: 'LaneLine' },
+        { y: 0.12, x0: -40, x1: 200, style: 'solid', width: 0.15, type: 'LaneLine' },
+        { y: -0.12, x0: -40, x1: 200, style: 'solid', width: 0.15, type: 'LaneLine' },
+        { y: 3.6, x0: -40, x1: 200, style: 'dashed', width: 0.15, dash: 6, gap: 9, type: 'LaneLine' },
+        { y: -3.6, x0: -40, x1: 200, style: 'dashed', width: 0.15, dash: 6, gap: 9, type: 'LaneLine' },
+        { y: 7.3, x0: -40, x1: 200, style: 'dashed', width: 0.15, dash: 6, gap: 9, type: 'LaneLine' },
+        { y: -7.3, x0: -40, x1: 200, style: 'dashed', width: 0.15, dash: 6, gap: 9, type: 'LaneLine' },
+      ],
+      arrows: [
+        { template: 'straight', x: 20, y: 1.75, heading: 0 },
+        { template: 'straight', x: 20, y: 5.4, heading: 0 },
+        { template: 'straight', x: 55, y: -1.75, heading: 180 },
+        { template: 'straight', x: 55, y: -5.4, heading: 180 },
+        { template: 'straight', x: 90, y: 9.1, heading: 0 },
+      ],
+      crosswalks: [],
+      stopLines: [],
+    },
     camera: { position: [-70, -70, 46], target: [70, 0, 0] },
   },
   {
@@ -135,6 +192,60 @@ const SCENES = [
       { trackId: 5, type: 'Cyclist', axis: 'x', start: 5, lateral: -5, speed: 4 },
     ],
     walkers: 5,
+    markings: {
+      // 主路（沿 X）车道线，在路口处断开
+      lanesX: [
+        { y: 6, x0: -40, x1: -2.5, style: 'solid', width: 0.15, type: 'LaneLine' },
+        { y: -6, x0: -40, x1: -2.5, style: 'solid', width: 0.15, type: 'LaneLine' },
+        { y: 0.12, x0: -40, x1: -2.5, style: 'solid', width: 0.12, type: 'LaneLine' },
+        { y: -0.12, x0: -40, x1: -2.5, style: 'solid', width: 0.12, type: 'LaneLine' },
+        { y: 3, x0: -40, x1: -2.5, style: 'dashed', width: 0.15, dash: 4, gap: 6, type: 'LaneLine' },
+        { y: -3, x0: -40, x1: -2.5, style: 'dashed', width: 0.15, dash: 4, gap: 6, type: 'LaneLine' },
+        { y: 6, x0: 18.5, x1: 60, style: 'solid', width: 0.15, type: 'LaneLine' },
+        { y: -6, x0: 18.5, x1: 60, style: 'solid', width: 0.15, type: 'LaneLine' },
+        { y: 0.12, x0: 18.5, x1: 60, style: 'solid', width: 0.12, type: 'LaneLine' },
+        { y: -0.12, x0: 18.5, x1: 60, style: 'solid', width: 0.12, type: 'LaneLine' },
+        { y: 3, x0: 18.5, x1: 60, style: 'dashed', width: 0.15, dash: 4, gap: 6, type: 'LaneLine' },
+        { y: -3, x0: 18.5, x1: 60, style: 'dashed', width: 0.15, dash: 4, gap: 6, type: 'LaneLine' },
+      ],
+      // 横向道路（沿 Y）车道线，在路口处断开
+      lanesY: [
+        { x: 2, y0: -46, y1: -10.5, style: 'solid', width: 0.15, type: 'LaneLine' },
+        { x: 14, y0: -46, y1: -10.5, style: 'solid', width: 0.15, type: 'LaneLine' },
+        { x: 8.12, y0: -46, y1: -10.5, style: 'solid', width: 0.12, type: 'LaneLine' },
+        { x: 7.88, y0: -46, y1: -10.5, style: 'solid', width: 0.12, type: 'LaneLine' },
+        { x: 5, y0: -46, y1: -10.5, style: 'dashed', width: 0.15, dash: 4, gap: 6, type: 'LaneLine' },
+        { x: 11, y0: -46, y1: -10.5, style: 'dashed', width: 0.15, dash: 4, gap: 6, type: 'LaneLine' },
+        { x: 2, y0: 10.5, y1: 46, style: 'solid', width: 0.15, type: 'LaneLine' },
+        { x: 14, y0: 10.5, y1: 46, style: 'solid', width: 0.15, type: 'LaneLine' },
+        { x: 8.12, y0: 10.5, y1: 46, style: 'solid', width: 0.12, type: 'LaneLine' },
+        { x: 7.88, y0: 10.5, y1: 46, style: 'solid', width: 0.12, type: 'LaneLine' },
+        { x: 5, y0: 10.5, y1: 46, style: 'dashed', width: 0.15, dash: 4, gap: 6, type: 'LaneLine' },
+        { x: 11, y0: 10.5, y1: 46, style: 'dashed', width: 0.15, dash: 4, gap: 6, type: 'LaneLine' },
+      ],
+      // 斑马线：along 表示条纹延伸方向，spread 为条纹覆盖宽度
+      crosswalks: [
+        { cx: 0, cy: 0, along: 'x', length: 3, spread: 11, stripeWidth: 0.55, gap: 0.55 },
+        { cx: 16, cy: 0, along: 'x', length: 3, spread: 11, stripeWidth: 0.55, gap: 0.55 },
+        { cx: 8, cy: -8, along: 'y', length: 3, spread: 11, stripeWidth: 0.55, gap: 0.55 },
+        { cx: 8, cy: 8, along: 'y', length: 3, spread: 11, stripeWidth: 0.55, gap: 0.55 },
+      ],
+      // 停止线
+      stopLines: [
+        { axis: 'y', at: -2.5, from: 0, to: 6, width: 0.4 },
+        { axis: 'y', at: 18.5, from: -6, to: 0, width: 0.4 },
+        { axis: 'x', at: 10.5, from: 8, to: 14, width: 0.4 },
+        { axis: 'x', at: -10.5, from: 2, to: 8, width: 0.4 },
+      ],
+      arrows: [
+        { template: 'straight', x: -9, y: 1.5, heading: 0 },
+        { template: 'left', x: -9, y: 4.5, heading: 0 },
+        { template: 'straight', x: 25, y: -1.5, heading: 180 },
+        { template: 'right', x: 25, y: -4.5, heading: 180 },
+        { template: 'straight', x: 11, y: -20, heading: -90 },
+        { template: 'straight', x: 5, y: 20, heading: 90 },
+      ],
+    },
     camera: { position: [-34, -32, 26], target: [16, 0, 0] },
   },
 ]
@@ -240,6 +351,200 @@ function polePoints(out, rng, profile, groundZ) {
 }
 
 /* ------------------------------------------------------------------ */
+/* 路面标线：车道线 / 斑马线 / 停止线 / 箭头
+ *   - 点云：高反射白色涂料点，位于地面上方 3~5cm
+ *   - 真值：shape:'line' / shape:'arrow' 的矢量对象
+ *   - 点级标签：按类别连续排列，索引在每帧中完全一致
+ * ------------------------------------------------------------------ */
+
+/** 生成一条沿 X 的车道线（实线整条，虚线按 dash/gap 切段） */
+function laneLineX(spec, groundZ, out, objects, seq) {
+  const z = groundZ + 0.04
+  const segs =
+    spec.style === 'dashed'
+      ? dashSegments(spec.x0, spec.x1, spec.dash || 4, spec.gap || 6)
+      : [[spec.x0, spec.x1]]
+  for (const [a, b] of segs) {
+    if (b - a < 0.2) continue
+    const points = [
+      [a, spec.y, z],
+      [b, spec.y, z],
+    ]
+    out.push(...sampleThickPolyline(points, spec.width, MARK_STEP))
+    objects.push(markLine(spec.type || 'LaneLine', spec.width, points, seq()))
+  }
+}
+
+/** 生成一条沿 Y 的车道线 */
+function laneLineY(spec, groundZ, out, objects, seq) {
+  const z = groundZ + 0.04
+  const segs =
+    spec.style === 'dashed'
+      ? dashSegments(spec.y0, spec.y1, spec.dash || 4, spec.gap || 6)
+      : [[spec.y0, spec.y1]]
+  for (const [a, b] of segs) {
+    if (b - a < 0.2) continue
+    const points = [
+      [spec.x, a, z],
+      [spec.x, b, z],
+    ]
+    out.push(...sampleThickPolyline(points, spec.width, MARK_STEP))
+    objects.push(markLine(spec.type || 'LaneLine', spec.width, points, seq()))
+  }
+}
+
+/** 按 dash/gap 切分区间 */
+function dashSegments(from, to, dash, gap) {
+  const out = []
+  const dir = to >= from ? 1 : -1
+  let v = from
+  while (dir > 0 ? v < to : v > to) {
+    const end = v + dir * dash
+    out.push([v, dir > 0 ? Math.min(end, to) : Math.max(end, to)])
+    v = end + dir * gap
+  }
+  return out
+}
+
+/** 斑马线：沿 along 方向的长条纹，spread 方向等距排布 */
+function crosswalk(spec, groundZ, out, objects, seq) {
+  const z = groundZ + 0.04
+  const count = Math.max(1, Math.floor((spec.spread + spec.gap) / (spec.stripeWidth + spec.gap)))
+  const total = count * spec.stripeWidth + (count - 1) * spec.gap
+  const start = -total / 2 + spec.stripeWidth / 2
+  for (let i = 0; i < count; i++) {
+    const off = start + i * (spec.stripeWidth + spec.gap)
+    let points
+    if (spec.along === 'x') {
+      points = [
+        [spec.cx - spec.length / 2, spec.cy + off, z],
+        [spec.cx + spec.length / 2, spec.cy + off, z],
+      ]
+    } else {
+      points = [
+        [spec.cx + off, spec.cy - spec.length / 2, z],
+        [spec.cx + off, spec.cy + spec.length / 2, z],
+      ]
+    }
+    out.push(...sampleThickPolyline(points, spec.stripeWidth, MARK_STEP))
+    objects.push(markLine('Crosswalk', spec.stripeWidth, points, seq()))
+  }
+}
+
+/** 停止线 */
+function stopLine(spec, groundZ, out, objects, seq) {
+  const z = groundZ + 0.04
+  const points =
+    spec.axis === 'y'
+      ? [
+          [spec.at, spec.from, z],
+          [spec.at, spec.to, z],
+        ]
+      : [
+          [spec.from, spec.at, z],
+          [spec.to, spec.at, z],
+        ]
+  out.push(...sampleThickPolyline(points, spec.width, MARK_STEP))
+  objects.push(markLine('StopLine', spec.width, points, seq()))
+}
+
+/** 箭头：模板放到世界坐标后采样 */
+function roadArrow(spec, groundZ, out, objects, seq) {
+  const z = groundZ + 0.05
+  const ry = (spec.heading * Math.PI) / 180
+  const paths = transformTemplate(spec.template, { x: spec.x, y: spec.y, z, ry, scale: 1 })
+  const width = spec.width ?? 0.32
+  for (const path of paths) out.push(...sampleArrowPath(path.map(([x, y]) => [x, y]), width, MARK_STEP, z))
+  objects.push({
+    id: `mark_${seq()}`,
+    shape: 'arrow',
+    type: 'RoadArrow',
+    classId: MARK_CLASS.RoadArrow,
+    width,
+    paths,
+    template: spec.template,
+    trackId: 0,
+    startFrame: 0,
+    multiFrame: false,
+    source: 'ground-truth',
+  })
+}
+
+function markLine(type, width, points, id) {
+  return {
+    id: `mark_${id}`,
+    shape: 'line',
+    type,
+    classId: MARK_CLASS[type] ?? MARK_CLASS.LaneLine,
+    width,
+    points,
+    trackId: 0,
+    startFrame: 0,
+    multiFrame: false,
+    source: 'ground-truth',
+  }
+}
+
+/**
+ * 生成整套标线（静态，所有帧共用）
+ * @returns {{points:number[][], objects:object[], segments:{classId:number,indices:number[]}[]}}
+ */
+function buildMarkings(profile, groundZ) {
+  const cfg = profile.markings
+  if (!cfg) return { points: [], objects: [], segments: [] }
+  let counter = 0
+  const seq = () => ++counter
+
+  // 按类别收集，保证点级标签的索引在每帧都连续稳定
+  const buckets = new Map() // classId -> number[][]
+  const objects = []
+  const pushTo = (type, pts) => {
+    const id = MARK_CLASS[type]
+    if (!buckets.has(id)) buckets.set(id, [])
+    buckets.get(id).push(...pts)
+  }
+
+  for (const spec of cfg.lanesX || []) {
+    const out = []
+    laneLineX(spec, groundZ, out, objects, seq)
+    pushTo(spec.type || 'LaneLine', out)
+  }
+  for (const spec of cfg.lanesY || []) {
+    const out = []
+    laneLineY(spec, groundZ, out, objects, seq)
+    pushTo(spec.type || 'LaneLine', out)
+  }
+  for (const spec of cfg.crosswalks || []) {
+    const out = []
+    crosswalk(spec, groundZ, out, objects, seq)
+    pushTo('Crosswalk', out)
+  }
+  for (const spec of cfg.stopLines || []) {
+    const out = []
+    stopLine(spec, groundZ, out, objects, seq)
+    pushTo('StopLine', out)
+  }
+  for (const spec of cfg.arrows || []) {
+    const out = []
+    roadArrow(spec, groundZ, out, objects, seq)
+    pushTo('RoadArrow', out)
+  }
+
+  const points = []
+  const segments = []
+  for (const classId of [MARK_CLASS.LaneLine, MARK_CLASS.Crosswalk, MARK_CLASS.StopLine, MARK_CLASS.RoadArrow]) {
+    const pts = buckets.get(classId)
+    if (!pts || !pts.length) continue
+    const start = points.length
+    points.push(...pts)
+    const indices = []
+    for (let i = start; i < points.length; i++) indices.push(i)
+    segments.push({ classId, indices })
+  }
+  return { points, objects, segments }
+}
+
+/* ------------------------------------------------------------------ */
 /* 单帧构建：把各类要素采样成点并生成真值对象 */
 /* ------------------------------------------------------------------ */
 
@@ -258,7 +563,7 @@ function applyDensity(profile, density) {
   }
 }
 
-function buildFrame(profile, frameIndex, rng, classOf) {
+function buildFrame(profile, frameIndex, rng, classOf, markings) {
   const dt = profile.dt
   const groundZ = -profile.sensorHeight
   const positions = []
@@ -274,6 +579,14 @@ function buildFrame(profile, frameIndex, rng, classOf) {
       positions.push(x, y, z)
       intensities.push(Math.max(0, Math.min(255, base * 220 * Math.exp(-d / 55) + 25 + (rng() - 0.5) * jitter)))
     }
+  }
+
+  // 标线点固定排在最前，保证逐帧点级标签索引稳定（场景为静态标线）
+  if (markings?.points?.length) {
+    const arr = []
+    for (const [x, y, z] of markings.points) arr.push(x, y, z)
+    // 白色涂料反射率高，且不随距离衰减太多，便于与地面区分
+    pushTyped(arr, 1.35, 4)
   }
 
   const ground = []
@@ -368,6 +681,9 @@ function buildFrame(profile, frameIndex, rng, classOf) {
     addObject('Pedestrian', 10 + i, cx, cy + Math.sin(phase * 0.7) * 0.5, centerZ('Pedestrian'), yaw, 0.18)
   }
 
+  // 静态路面标线矢量真值（与点云中的标线点一一对应）
+  if (markings?.objects?.length) objects.push(...markings.objects)
+
   return { positions, intensities, objects }
 }
 
@@ -450,14 +766,17 @@ async function generateScene(profile, args, outRoot, classOf) {
   const sceneDir = join(outRoot, profile.id)
   await rm(sceneDir, { recursive: true, force: true })
   await mkdir(join(sceneDir, 'labels'), { recursive: true })
+  await mkdir(join(sceneDir, 'point_labels'), { recursive: true })
 
   // 按密度倍率缩放采样步长，得到更大的数据量
   const eff = applyDensity(profile, args.density)
+  const groundZ = -profile.sensorHeight
+  const markings = buildMarkings(profile, groundZ)
   const rng = mulberry32(profile.seed)
   const meta = []
   for (let i = 0; i < frames; i++) {
     const id = String(i).padStart(6, '0')
-    const { positions, intensities, objects } = buildFrame(eff, i, rng, classOf)
+    const { positions, intensities, objects } = buildFrame(eff, i, rng, classOf, markings)
     if (formats.includes('bin')) await writeFile(join(sceneDir, `frame_${id}.bin`), toKittiBin(positions, intensities))
     if (formats.includes('pcd')) await writeFile(join(sceneDir, `frame_${id}.pcd`), toPcdBinary(positions, intensities))
     if (formats.includes('ply')) await writeFile(join(sceneDir, `frame_${id}.ply`), toPlyBinary(positions, intensities))
@@ -469,8 +788,18 @@ async function generateScene(profile, args, outRoot, classOf) {
       pcd: formats.includes('pcd') ? `frame_${id}.pcd` : undefined,
       ply: formats.includes('ply') ? `frame_${id}.ply` : undefined,
       label: `labels/frame_${id}.json`,
+      pointLabels: markings.segments.length ? 'point_labels/markings.json' : undefined,
       points: intensities.length,
     })
+  }
+
+  // 标线点级标签：所有帧的标线点排在最前且数量一致，因此可共用一份索引文件
+  if (markings.segments.length) {
+    const labeled = markings.segments.reduce((s, seg) => s + seg.indices.length, 0)
+    await writeFile(
+      join(sceneDir, 'point_labels', 'markings.json'),
+      JSON.stringify({ pointCount: markings.points.length, labeled, segments: markings.segments }),
+    )
   }
 
   const scene = {
@@ -494,7 +823,8 @@ async function generateScene(profile, args, outRoot, classOf) {
   const approxMB = (total * bytesPerPoint) / 1024 / 1024
   console.log(
     `[gen] ${profile.id.padEnd(10)} 密度 ${(eff.density || 1).toFixed(1)}x  ${String(frames).padStart(3)} 帧  ` +
-      `平均 ${Math.round(total / frames).toLocaleString()} 点/帧  合计 ${total.toLocaleString()} 点  ≈${approxMB.toFixed(0)} MB`,
+      `平均 ${Math.round(total / frames).toLocaleString()} 点/帧  合计 ${total.toLocaleString()} 点  ≈${approxMB.toFixed(0)} MB  ` +
+      `标线 ${markings.objects.length} 个 / ${markings.points.length.toLocaleString()} 点`,
   )
   return {
     id: profile.id,
@@ -503,6 +833,15 @@ async function generateScene(profile, args, outRoot, classOf) {
     frames,
     pointsPerFrame: Math.round(total / frames),
     totalPoints: total,
+    markings: {
+      objects: markings.objects.length,
+      points: markings.points.length,
+      classes: markings.segments.map((s) => ({
+        classId: s.classId,
+        name: CLASSES.find((c) => c.id === s.classId)?.name,
+        points: s.indices.length,
+      })),
+    },
     camera: profile.camera,
     classes: CLASSES,
   }

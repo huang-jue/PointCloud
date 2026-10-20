@@ -22,8 +22,11 @@ import * as THREE from 'three'
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js'
 import { TransformControls } from 'three/examples/jsm/controls/TransformControls.js'
 import { BBox3D } from './helpers/BBox3D.js'
+import { RoadMarking3D, buildMarkingGeometry } from './helpers/RoadMarking3D.js'
 import { loadPointCloud } from './loaders/index.js'
 import { intensityToColor, heightToColor, labelsToColor } from './helpers/PointColorizer.js'
+import { transformTemplate, clonePoints } from '../utils/polyline.js'
+import { get } from '../utils/http.js'
 
 /** 帧级点云缓存上限（超出后按 LRU 淘汰） */
 const MAX_CACHE = 8
@@ -42,6 +45,12 @@ const MOUSE_DEFAULT = {
   RIGHT: THREE.MOUSE.ROTATE,
 }
 const MOUSE_SEGMENT = {
+  LEFT: null,
+  MIDDLE: THREE.MOUSE.PAN,
+  RIGHT: THREE.MOUSE.ROTATE,
+}
+/** 绘制模式：左键留给落点 */
+const MOUSE_DRAW = {
   LEFT: null,
   MIDDLE: THREE.MOUSE.PAN,
   RIGHT: THREE.MOUSE.ROTATE,
@@ -89,6 +98,32 @@ export class PointCloudViewer {
     this.boxRoot = new THREE.Group()
     this.scene.add(this.boxRoot)
     this.boxes = new Map() // objectId -> BBox3D
+
+    /* ---------- 路面标线容器 ---------- */
+    this.markRoot = new THREE.Group()
+    this.scene.add(this.markRoot)
+    this.marks = new Map() // objectId -> RoadMarking3D
+
+    /* ---------- 标线顶点手柄 ---------- */
+    this.vertexRoot = new THREE.Group()
+    this.scene.add(this.vertexRoot)
+    this.vertexGeo = new THREE.SphereGeometry(1, 10, 8)
+    this.vertexHandles = []
+    this.vertexDrag = null // { objId, pathIndex, index }
+    this.vertexObjectId = null // 当前显示手柄的标线对象
+    this._suppressClick = false // Alt+点击删除顶点后，忽略同一次 pointerup 的拾取
+
+    /* ---------- 绘制草稿（画线/画箭头时的预览） ---------- */
+    this.drawRoot = new THREE.Group()
+    this.scene.add(this.drawRoot)
+    this.drawMode = null // null | 'line' | 'arrow'
+    this.drawPoints = [] // 已落下的点 [[x,y,z],...]
+    this.drawHover = null // 鼠标悬停点
+    this.drawTemplate = 'free'
+    this.drawWidth = 0.15
+    this.drawHeading = 0
+    this.groundZ = -1.73
+    this._drawPreview = null
 
     /* ---------- 缩放手柄（自定义，替代 TransformControls 的 scale 模式） ---------- */
     // 三个球分别位于框的 +X/+Y/+Z 面中心，拖动即可改变 长/宽/高
@@ -147,6 +182,7 @@ export class PointCloudViewer {
     this.currentKey = null
     this.cache = new Map()
     this.labelsByKey = new Map() // 按帧缓存键保存点级标签，独立于点云 LRU 缓存
+    this.pointLabelFiles = new Map() // 点级标签文件缓存（URL -> 解析结果），避免逐帧重复请求
     this.colorMode = 'intensity'
 
     /* ---------- 拾取相关 ---------- */
@@ -176,11 +212,13 @@ export class PointCloudViewer {
     this._onPointerDown = this._onPointerDown.bind(this)
     this._onPointerMove = this._onPointerMove.bind(this)
     this._onPointerUp = this._onPointerUp.bind(this)
+    this._onDoubleClick = this._onDoubleClick.bind(this)
     this._animate = this._animate.bind(this)
 
     this.renderer.domElement.addEventListener('pointerdown', this._onPointerDown)
     this.renderer.domElement.addEventListener('pointermove', this._onPointerMove)
     this.renderer.domElement.addEventListener('pointerup', this._onPointerUp)
+    this.renderer.domElement.addEventListener('dblclick', this._onDoubleClick)
 
     this.resizeObserver = new ResizeObserver(this._onResize)
     this.resizeObserver.observe(container)
@@ -193,7 +231,17 @@ export class PointCloudViewer {
   /** 渲染循环 */
   _animate() {
     this.controls.update() // damping 需要每帧 update
+    this._updateHandleScales()
     this.renderer.render(this.scene, this.camera)
+  }
+
+  /** 顶点手柄按相机距离缩放，保证屏幕上大小稳定、始终好点中 */
+  _updateHandleScales() {
+    if (!this.vertexHandles.length) return
+    for (const h of this.vertexHandles) {
+      const d = h.position.distanceTo(this.camera.position)
+      h.scale.setScalar(Math.max(0.04, d * 0.012))
+    }
   }
 
   /** 容器尺寸变化时同步相机宽高比与渲染器大小 */
@@ -218,9 +266,23 @@ export class PointCloudViewer {
     return { x: event.clientX - rect.left, y: event.clientY - rect.top }
   }
 
-  /** 指针按下：优先抓取缩放手柄；分割模式下左键开始框选；否则记录起点用于区分点击/拖动 */
+  /** 指针按下：优先抓取缩放手柄/标线顶点；分割模式下左键开始框选；否则记录起点用于区分点击/拖动 */
   _onPointerDown(event) {
     this._down = { x: event.clientX, y: event.clientY, t: performance.now() }
+    // 标线顶点拖动（选中标线后显示的手柄；绘制模式下不响应，避免误拖）
+    if (event.button === 0 && !this.drawMode && this.vertexHandles.length) {
+      const hit = this._pickVertex(event)
+      if (hit) {
+        if (event.altKey) {
+          // Alt+点击：删除该顶点（并阻止随后的单击重新拾取）
+          this._suppressClick = true
+          this.callbacks.onVertexDelete?.(hit.objId, hit.index, hit.pathIndex)
+          return
+        }
+        this._startVertexDrag(hit)
+        return
+      }
+    }
     // 缩放工具：命中手柄则开始拖动缩放
     if (this.activeTool === 'scale' && !this.segEnabled && event.button === 0) {
       const idx = this._pickScaleHandle(event)
@@ -245,10 +307,19 @@ export class PointCloudViewer {
     }
   }
 
-  /** 指针移动：优先处理缩放拖动，其次更新分割框选图形 */
+  /** 指针移动：优先处理缩放拖动/顶点拖动/绘制预览，其次更新分割框选图形 */
   _onPointerMove(event) {
     if (this._scaleState) {
       this._updateScale(event)
+      return
+    }
+    if (this.vertexDrag) {
+      this._updateVertexDrag(event)
+      return
+    }
+    if (this.drawMode) {
+      this.drawHover = this._groundPoint(event)
+      this._updateDrawPreview()
       return
     }
     if (!this._selecting || this.transform.axis !== null) return
@@ -281,6 +352,19 @@ export class PointCloudViewer {
   _onPointerUp(event) {
     if (this._scaleState) {
       this._endScale()
+      return
+    }
+    if (this.vertexDrag) {
+      this._endVertexDrag()
+      return
+    }
+    if (this._suppressClick) {
+      this._suppressClick = false
+      return
+    }
+    if (this.drawMode) {
+      const moved = Math.hypot(event.clientX - this._down.x, event.clientY - this._down.y) > 4
+      if (!moved && event.button === 0) this._handleDrawClick(event)
       return
     }
     if (this._selecting) {
@@ -332,22 +416,328 @@ export class PointCloudViewer {
     const moved = Math.hypot(dx, dy) > 4
     if (moved || this.transform.axis !== null) return
     if (event.button !== 0) return
-    // 标签模式下单击优先拾取语义标签
-    if (this.segEnabled || this.colorMode === 'label') {
+    // 分割模式下单击只拾取语义标签
+    if (this.segEnabled) {
       this.selectSegmentAt(event)
       return
     }
+    // 标签着色下：光标附近有已标注点时优先编辑该片段，否则继续拾取框/标线
+    if (this.colorMode === 'label' && this.currentCloud?.pointSegment) {
+      const p = this._localPoint(event)
+      if (this._pickNearestPoint(p.x, p.y, 12, true) >= 0) {
+        this.selectSegmentAt(event)
+        return
+      }
+    }
     this._updatePointer(event)
     this.raycaster.setFromCamera(this.pointer, this.camera)
-    const hits = this.raycaster.intersectObjects(this.boxRoot.children, true)
+    const hits = this.raycaster.intersectObjects([...this.boxRoot.children, ...this.markRoot.children], true)
     for (const hit of hits) {
       const pick = hit.object.userData.pick
-      if (pick && pick.kind === 'box') {
+      if (pick && (pick.kind === 'box' || pick.kind === 'mark')) {
         this.callbacks.onSelect?.(pick.ref.objectId)
         return
       }
     }
     this.callbacks.onSelect?.(null)
+  }
+
+  /** 双击：绘制模式下完成当前标线 */
+  _onDoubleClick() {
+    if (this.drawMode) this.finishDrawing()
+  }
+
+  /* ---------------- 路面标线：绘制 ---------------- */
+
+  /** 进入/退出绘制模式（左键留给落点） */
+  setDrawMode(mode) {
+    const next = mode === 'line' || mode === 'arrow' ? mode : null
+    if (next === this.drawMode) return
+    this.drawMode = next
+    this.drawPoints = []
+    this.drawHover = null
+    this.controls.mouseButtons = next ? { ...MOUSE_DRAW } : this.segEnabled ? { ...MOUSE_SEGMENT } : { ...MOUSE_DEFAULT }
+    this._updateDrawPreview()
+    this.callbacks.onDrawChange?.(this.drawPoints.length)
+  }
+
+  /** 同步绘制选项 */
+  setDrawOptions({ width, template, heading, groundZ } = {}) {
+    if (width != null) this.drawWidth = width
+    if (template != null) this.drawTemplate = template
+    if (heading != null) this.drawHeading = heading
+    if (groundZ != null) this.groundZ = groundZ
+    this._updateDrawPreview()
+  }
+
+  /** 完成绘制：把草稿交给上层生成标注对象 */
+  finishDrawing() {
+    if (!this.drawMode) return false
+    const mode = this.drawMode
+    const points = clonePoints(this.drawPoints)
+    // 模板箭头在单击落点时即生成，Enter 视为已完成
+    if (mode === 'arrow' && this.drawTemplate !== 'free') return true
+    if (points.length < 2) return false
+    this._resetDraft()
+    if (mode === 'arrow') {
+      this.callbacks.onDrawFinish?.({ shape: 'arrow', paths: [points], width: this.drawWidth, template: null })
+    } else {
+      this.callbacks.onDrawFinish?.({ shape: 'line', points, width: this.drawWidth })
+    }
+    return true
+  }
+
+  /** 取消当前草稿 */
+  cancelDrawing() {
+    this._resetDraft()
+  }
+
+  /** 退掉最后一个落点 */
+  undoDrawPoint() {
+    if (!this.drawPoints.length) return false
+    this.drawPoints.pop()
+    this._updateDrawPreview()
+    this.callbacks.onDrawChange?.(this.drawPoints.length)
+    return true
+  }
+
+  /** 是否有正在进行的草稿 */
+  hasDraft() {
+    return this.drawPoints.length > 0
+  }
+
+  _resetDraft() {
+    this.drawPoints = []
+    this.drawHover = null
+    this._updateDrawPreview()
+    this.callbacks.onDrawChange?.(0)
+  }
+
+  /** 左键落点；模板箭头单击即放置 */
+  _handleDrawClick(event) {
+    const p = this._groundPoint(event)
+    if (!p) return
+    if (this.drawMode === 'arrow' && this.drawTemplate !== 'free') {
+      const paths = transformTemplate(this.drawTemplate, {
+        x: p[0],
+        y: p[1],
+        z: p[2],
+        ry: (this.drawHeading * Math.PI) / 180,
+        scale: 1,
+      })
+      this.callbacks.onDrawFinish?.({
+        shape: 'arrow',
+        paths,
+        width: this.drawWidth,
+        template: this.drawTemplate,
+      })
+      this._resetDraft()
+      return
+    }
+    // 与上一点过近则忽略（避免双击完成时留下重复点）
+    const last = this.drawPoints[this.drawPoints.length - 1]
+    if (last && Math.hypot(p[0] - last[0], p[1] - last[1]) < 0.15) return
+    this.drawPoints.push(p)
+    this.drawHover = p
+    this._updateDrawPreview()
+    this.callbacks.onDrawChange?.(this.drawPoints.length)
+  }
+
+  /**
+   * 屏幕坐标 -> 水平面交点
+   * @param {PointerEvent} event
+   * @param {number} [planeZ] 目标平面高度，缺省为地面
+   */
+  _groundPoint(event, planeZ = this.groundZ) {
+    this._updatePointer(event)
+    this.raycaster.setFromCamera(this.pointer, this.camera)
+    const ray = this.raycaster.ray
+    const dir = ray.direction
+    if (Math.abs(dir.z) < 1e-6) return null
+    const t = (planeZ - ray.origin.z) / dir.z
+    if (t <= 0) return null
+    const x = ray.origin.x + dir.x * t
+    const y = ray.origin.y + dir.y * t
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return null
+    return [x, y, planeZ]
+  }
+
+  /** 刷新绘制预览（已落点 + 悬停橡皮筋） */
+  _updateDrawPreview() {
+    if (this._drawPreview) {
+      this.drawRoot.remove(this._drawPreview)
+      disposeObject(this._drawPreview)
+      this._drawPreview = null
+    }
+    if (!this.drawMode) return
+    const paths = []
+    if (this.drawPoints.length) {
+      const pts = clonePoints(this.drawPoints)
+      if (this.drawHover) pts.push(this.drawHover)
+      paths.push(pts)
+    } else if (this.drawHover && this.drawMode === 'arrow' && this.drawTemplate !== 'free') {
+      // 模板箭头：在悬停位置显示半透明预览
+      paths.push(
+        ...transformTemplate(this.drawTemplate, {
+          x: this.drawHover[0],
+          y: this.drawHover[1],
+          z: this.drawHover[2],
+          ry: (this.drawHeading * Math.PI) / 180,
+          scale: 1,
+        }),
+      )
+    }
+    if (!paths.length) return
+    const group = new THREE.Group()
+    // 草稿比实际线宽略宽、用亮黄色，确保在密集点云上也能看清
+    const draftWidth = Math.max(this.drawWidth, 0.3) * 1.25
+    const geometry = buildMarkingGeometry(paths, draftWidth, this.drawMode === 'arrow')
+    const mat = new THREE.MeshBasicMaterial({
+      color: 0xffd166,
+      transparent: true,
+      opacity: 0.9,
+      side: THREE.DoubleSide,
+      depthTest: false,
+    })
+    const mesh = new THREE.Mesh(geometry, mat)
+    mesh.renderOrder = 900
+    group.add(mesh)
+    // 落点标记
+    const dotMat = new THREE.MeshBasicMaterial({ color: 0xffd166, depthTest: false })
+    for (const [x, y, z] of this.drawPoints) {
+      const dot = new THREE.Mesh(new THREE.SphereGeometry(0.09, 8, 6), dotMat)
+      dot.position.set(x, y, z)
+      dot.renderOrder = 901
+      group.add(dot)
+    }
+    this._drawPreview = group
+    this.drawRoot.add(group)
+  }
+
+  /* ---------------- 路面标线：同步与顶点编辑 ---------------- */
+
+  /**
+   * 让视口中的标线与数据保持一致
+   * @param {Array} objects 当前帧对象
+   * @param {Array} classes 类别表
+   * @param {string|null} selectedId 选中对象 id
+   */
+  syncMarks(objects, classes, selectedId) {
+    const seen = new Set()
+    const colorOf = (classId) => {
+      const c = classes.find((x) => x.id === classId)
+      return c ? c.color : '#f2f4f8'
+    }
+    for (const obj of objects) {
+      if (obj.shape !== 'line' && obj.shape !== 'arrow') continue
+      seen.add(obj.id)
+      let mark = this.marks.get(obj.id)
+      if (!mark) {
+        mark = new RoadMarking3D(colorOf(obj.classId))
+        this.marks.set(obj.id, mark)
+        this.markRoot.add(mark.group)
+      }
+      mark.apply(obj, colorOf(obj.classId))
+      mark.setSelected(obj.id === selectedId)
+    }
+    for (const [id, mark] of Array.from(this.marks.entries())) {
+      if (!seen.has(id)) {
+        this.markRoot.remove(mark.group)
+        mark.dispose()
+        this.marks.delete(id)
+        if (this.vertexObjectId === id) this.showVertexHandles(null)
+      }
+    }
+    // 绘制过程中不显示顶点手柄，避免与落点混淆
+    if (this.drawMode) {
+      if (this.vertexObjectId) this.showVertexHandles(null)
+      return
+    }
+    // 选中标线时显示顶点手柄（拖动过程中不重建，否则会丢失当前拖拽的 mesh）
+    if (this.vertexDrag) return
+    const sel = objects.find((o) => o.id === selectedId)
+    if (sel && (sel.shape === 'line' || sel.shape === 'arrow')) {
+      // 顶点数量与对象一致时只更新位置，避免每次同步都重建
+      const count = sel.shape === 'line' ? sel.points?.length || 0 : (sel.paths || []).reduce((s, p) => s + p.length, 0)
+      if (this.vertexObjectId === sel.id && this.vertexHandles.length === count) {
+        this._updateVertexPositions(sel)
+        return
+      }
+      this.showVertexHandles(sel)
+    } else if (this.vertexObjectId) this.showVertexHandles(null)
+  }
+
+  /** 仅更新已有顶点手柄的位置 */
+  _updateVertexPositions(obj) {
+    const paths = obj.shape === 'line' ? [obj.points || []] : obj.paths || []
+    let k = 0
+    for (const path of paths) {
+      for (const [x, y, z] of path) {
+        const h = this.vertexHandles[k++]
+        if (h) h.position.set(x, y, z)
+      }
+    }
+  }
+
+  /**
+   * 显示某个标线的顶点手柄（传 null 隐藏）
+   * @param {object|null} obj 标线对象
+   */
+  showVertexHandles(obj) {
+    this.vertexObjectId = obj ? obj.id : null
+    for (const h of this.vertexHandles) {
+      this.vertexRoot.remove(h)
+      h.material.dispose()
+    }
+    this.vertexHandles = []
+    if (!obj) return
+    const paths = obj.shape === 'line' ? [obj.points || []] : obj.paths || []
+    paths.forEach((path, pathIndex) => {
+      path.forEach(([x, y, z], index) => {
+        const mat = new THREE.MeshBasicMaterial({ color: 0xffd166, depthTest: false, transparent: true, opacity: 0.95 })
+        const mesh = new THREE.Mesh(this.vertexGeo, mat)
+        mesh.position.set(x, y, z)
+        mesh.scale.setScalar(0.1)
+        mesh.renderOrder = 950
+        mesh.userData.vertex = { objId: obj.id, pathIndex, index }
+        this.vertexRoot.add(mesh)
+        this.vertexHandles.push(mesh)
+      })
+    })
+  }
+
+  /** 拾取顶点手柄 */
+  _pickVertex(event) {
+    if (!this.vertexHandles.length) return null
+    this._updatePointer(event)
+    this.raycaster.setFromCamera(this.pointer, this.camera)
+    const hits = this.raycaster.intersectObjects(this.vertexHandles, false)
+    return hits.length ? hits[0].object.userData.vertex : null
+  }
+
+  _startVertexDrag(hit) {
+    const mesh = this.vertexHandles.find(
+      (h) => h.userData.vertex.index === hit.index && h.userData.vertex.pathIndex === hit.pathIndex,
+    )
+    if (!mesh) return
+    this.vertexDrag = { ...hit, mesh }
+    this.controls.enabled = false
+  }
+
+  _updateVertexDrag(event) {
+    const st = this.vertexDrag
+    if (!st) return
+    // 保持顶点原有高度（标线通常比地面略高），只改平面位置
+    const z = st.mesh.position.z
+    const p = this._groundPoint(event, z)
+    if (!p) return
+    st.mesh.position.set(p[0], p[1], p[2])
+    this.callbacks.onVertexChange?.(st.objId, st.index, p, st.pathIndex)
+  }
+
+  _endVertexDrag() {
+    this.vertexDrag = null
+    this.controls.enabled = true
   }
 
   /* ---------------- 点云加载 / 显示 ---------------- */
@@ -382,9 +772,55 @@ export class PointCloudViewer {
   /** 显示某一帧（加载 + 构建几何体） */
   async showFrame(frame) {
     const cloud = await this.getCloud(frame)
+    await this._loadPointLabels(frame, cloud)
+    // 标签可能在点云加载之后才就绪，这里再挂一次，保证首次显示即为标签着色
+    if (!cloud.pointLabels) this._attachSavedLabels(cloud)
     this.setCloud(cloud)
     frame.pointCount = cloud.pointCount
     return cloud
+  }
+
+  /**
+   * 加载帧附带的点级语义标签文件（scene.json 中的 pointLabels 字段）。
+   * 标签按帧缓存键写入 labelsByKey，格式与手工标注一致，因此可以继续编辑/导出。
+   * 失败只告警，不影响点云显示。
+   */
+  async _loadPointLabels(frame, cloud) {
+    if (!frame?.pointLabelsUrl || !cloud?.key) return
+    if (this.labelsByKey.has(cloud.key)) return
+    try {
+      let data = this.pointLabelFiles.get(frame.pointLabelsUrl)
+      if (!data) {
+        data = await get(frame.pointLabelsUrl, null, { silent: true })
+        this.pointLabelFiles.set(frame.pointLabelsUrl, data)
+      }
+      if (!data || !Array.isArray(data.segments)) return
+      const n = cloud.pointCount
+      const labels = new Int32Array(n).fill(-1)
+      const pointSegment = new Int32Array(n).fill(-1)
+      const segments = []
+      let segId = 0
+      for (const seg of data.segments) {
+        const classId = Number(seg.classId)
+        const indices = (seg.indices || []).filter((i) => Number.isInteger(i) && i >= 0 && i < n)
+        if (!indices.length) continue
+        const id = ++segId
+        segments.push({ id, classId, indices: Int32Array.from(indices) })
+        for (const i of indices) {
+          labels[i] = classId
+          pointSegment[i] = id
+        }
+      }
+      if (!segments.length) return
+      this.segmentSeq = Math.max(this.segmentSeq, segId)
+      this.labelsByKey.set(cloud.key, { pointLabels: labels, pointSegment, segments, labelHistory: [] })
+      // 与手工标签共用同一个 LRU 上限，避免逐帧浏览大场景时内存持续增长
+      while (this.labelsByKey.size > MAX_LABEL_FRAMES) {
+        this.labelsByKey.delete(this.labelsByKey.keys().next().value)
+      }
+    } catch (err) {
+      console.warn('[PointCloudViewer] 点级标签加载失败:', frame.pointLabelsUrl, err)
+    }
   }
 
   /** 用点云数据构建 BufferGeometry 并替换当前显示对象 */
@@ -407,10 +843,11 @@ export class PointCloudViewer {
     this.pointGeometry = geometry
     this.scene.add(this.pointObject)
 
-    // 切换帧后清空上一次的选中
+    // 切换帧后清空上一次的选中与未完成的绘制草稿
     this.selectionMask = null
     this.selectionCount = 0
     this.selectedSegmentId = null
+    if (this.drawPoints.length) this._resetDraft()
     this.callbacks.onSelection?.(0)
     this.callbacks.onSegmentSelect?.(null)
   }
@@ -560,17 +997,22 @@ export class PointCloudViewer {
   /** 绑定/解绑编辑手柄：平移/旋转用 TransformControls，缩放用自定义手柄 */
   attachGizmo(objectId) {
     this.gizmoObjectId = objectId
-    const usable =
-      objectId && this.boxes.has(objectId) && this.activeTool !== 'select' && this.activeTool !== 'scale'
+    const noGizmo = ['select', 'scale', 'line', 'arrow']
+    const usable = objectId && this.boxes.has(objectId) && !noGizmo.includes(this.activeTool)
     if (usable) this.transform.attach(this.boxes.get(objectId).group)
     else this.transform.detach()
     this._refreshScaleHandles()
   }
 
-  /** 切换工具：平移/旋转 -> TransformControls；缩放 -> 自定义面手柄 */
+  /** 切换工具：平移/旋转 -> TransformControls；缩放 -> 自定义面手柄；绘制模式不显示手柄 */
   setGizmoMode(mode) {
-    if (!['select', 'translate', 'rotate', 'scale'].includes(mode)) return
+    if (!['select', 'translate', 'rotate', 'scale', 'line', 'arrow'].includes(mode)) return
     this.activeTool = mode
+    if (mode === 'line' || mode === 'arrow') {
+      this.transform.detach()
+      this._refreshScaleHandles()
+      return
+    }
     if (mode === 'translate' || mode === 'rotate') {
       this.transform.setMode(mode)
       // 旋转只开放绕 Z 轴（偏航）
@@ -662,8 +1104,17 @@ export class PointCloudViewer {
     this.controls.enabled = true
   }
 
-  /** 把轨道控制器焦点移动到某个对象 */
+  /** 把轨道控制器焦点移动到某个对象（框用中心，标线用包围盒中心） */
   focusObject(obj) {
+    if (obj.shape === 'line' || obj.shape === 'arrow') {
+      const mark = this.marks.get(obj.id)
+      const center = mark?.center()
+      if (center) {
+        this.controls.target.copy(center)
+        this.controls.update()
+      }
+      return
+    }
     const box = this.boxes.get(obj.id)
     if (!box) return
     this.controls.target.set(obj.x, obj.y, obj.z)
@@ -696,7 +1147,11 @@ export class PointCloudViewer {
   /** 开关分割模式，并切换鼠标按键映射（左键让给框选） */
   setSegEnabled(enabled) {
     this.segEnabled = !!enabled
-    this.controls.mouseButtons = this.segEnabled ? { ...MOUSE_SEGMENT } : { ...MOUSE_DEFAULT }
+    this.controls.mouseButtons = this.drawMode
+      ? { ...MOUSE_DRAW }
+      : this.segEnabled
+        ? { ...MOUSE_SEGMENT }
+        : { ...MOUSE_DEFAULT }
     if (!this.segEnabled) {
       this._sketch = null
       this.callbacks.onSketch?.(null)
@@ -842,6 +1297,28 @@ export class PointCloudViewer {
     })
     while (this.labelsByKey.size > MAX_LABEL_FRAMES) {
       this.labelsByKey.delete(this.labelsByKey.keys().next().value)
+    }
+  }
+
+  /**
+   * 取出某帧已保存的点标签并转成可序列化结构（供保存/导出）
+   * 无标签时返回 null
+   */
+  serializeLabels(key) {
+    const saved = key ? this.labelsByKey.get(key) : null
+    if (!saved || !saved.pointLabels) return null
+    const labels = saved.pointLabels
+    let labeled = 0
+    for (let i = 0; i < labels.length; i++) if (labels[i] >= 0) labeled++
+    if (!labeled) return null
+    return {
+      pointCount: labels.length,
+      labeled,
+      labels: Array.from(labels),
+      segments: (saved.segments || []).map((s) => ({
+        classId: s.classId,
+        indices: Array.from(s.indices),
+      })),
     }
   }
 
@@ -1068,10 +1545,17 @@ export class PointCloudViewer {
     this.renderer.domElement.removeEventListener('pointerdown', this._onPointerDown)
     this.renderer.domElement.removeEventListener('pointermove', this._onPointerMove)
     this.renderer.domElement.removeEventListener('pointerup', this._onPointerUp)
+    this.renderer.domElement.removeEventListener('dblclick', this._onDoubleClick)
     this.transform.dispose()
     this.controls.dispose()
     for (const box of this.boxes.values()) box.dispose()
     this.boxes.clear()
+    for (const mark of this.marks.values()) mark.dispose()
+    this.marks.clear()
+    for (const h of this.vertexHandles) h.material.dispose()
+    this.vertexHandles = []
+    this.vertexGeo.dispose()
+    if (this._drawPreview) disposeObject(this._drawPreview)
     this.labelsByKey.clear()
     this.scaleHandleGeo.dispose()
     for (const h of this.scaleHandles) h.material.dispose()
@@ -1084,6 +1568,15 @@ export class PointCloudViewer {
       this.renderer.domElement.parentNode.removeChild(this.renderer.domElement)
     }
   }
+}
+
+/** 递归释放一个 Object3D 子树中的几何体与材质 */
+function disposeObject(root) {
+  root.traverse((node) => {
+    if (node.geometry) node.geometry.dispose()
+    if (Array.isArray(node.material)) node.material.forEach((m) => m.dispose())
+    else if (node.material) node.material.dispose()
+  })
 }
 
 /** 射线法判断点是否在多边形内（套索选择用） */

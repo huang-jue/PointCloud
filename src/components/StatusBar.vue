@@ -28,6 +28,9 @@ const coordText = computed(
     </span>
     <span v-else>无数据</span>
     <span>本帧对象 <b>{{ currentObjects.length }}</b></span>
+    <span v-if="state.tool === 'line' || state.tool === 'arrow'" class="mono">
+      绘制中 · 已落点 {{ state.draftCount }}
+    </span>
     <el-tooltip :content="`坐标约定 ${coordText}`" placement="top">
       <span style="cursor: help">坐标 Z↑</span>
     </el-tooltip>
@@ -35,7 +38,7 @@ const coordText = computed(
     <span v-if="totalPoints" class="mono">累计点数 {{ totalPoints.toLocaleString() }}</span>
     <el-tooltip
       placement="top"
-      content="← → 切帧 · 空格 播放 · Q/W/E/R 选择/移动/旋转/缩放 · R 模式下拖拽彩色面手柄改尺寸 · B 分割模式 · F 适应视角 · Del 删除 · Ctrl+Z 撤销标签 · 左键拖拽平移 · 右键拖拽旋转"
+      content="← → 切帧 · 空格 播放 · Q/W/E/R 选择/移动/旋转/缩放 · L 画线 · A 画箭头 · 绘制时 Enter 完成 / Esc 取消 / Backspace 退点 · Alt+点击顶点删除 · B 分割模式 · F 适应视角 · Del 删除 · Ctrl+Z 撤销标签 · 左键拖拽平移 · 右键拖拽旋转"
     >
       <span class="hint" style="cursor: help">快捷键 ⓘ</span>
     </el-tooltip>

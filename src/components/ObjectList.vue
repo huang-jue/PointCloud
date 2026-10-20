@@ -12,15 +12,33 @@ import {
 } from '../stores/useAnnotationStore.js'
 import { viewerRef } from '../three/viewerRef.js'
 import { requestRemoveObject } from '../utils/actions.js'
+import { polylineLength } from '../utils/polyline.js'
 
 /** 双击让视口聚焦到该对象 */
 function focusObject(obj) {
   viewerRef.current?.focusObject(obj)
 }
 
-/** 尺寸展示文案：长×宽×高 */
+/** 尺寸/形状展示文案 */
 function dims(obj) {
+  if (obj.shape === 'line') {
+    const n = obj.points?.length || 0
+    return `${n} 点 · ${polylineLength(obj.points).toFixed(1)}m`
+  }
+  if (obj.shape === 'arrow') {
+    const paths = obj.paths || []
+    const n = paths.reduce((s, p) => s + p.length, 0)
+    const len = paths.reduce((s, p) => s + polylineLength(p), 0)
+    return `${paths.length} 路径 · ${n} 点 · ${len.toFixed(1)}m`
+  }
   return `${obj.l.toFixed(1)}×${obj.w.toFixed(1)}×${obj.h.toFixed(1)}`
+}
+
+/** 对象类型标签 */
+function kindTag(obj) {
+  if (obj.shape === 'line') return '线'
+  if (obj.shape === 'arrow') return '箭头'
+  return ''
 }
 
 function remove(obj) {
@@ -62,9 +80,13 @@ function remove(obj) {
           <div class="obj-main">
             <div class="obj-name">
               {{ obj.type }}
+              <el-tag v-if="kindTag(obj)" size="small" type="info" effect="plain">{{ kindTag(obj) }}</el-tag>
               <el-tag v-if="obj.trackId" size="small" type="warning" effect="plain">T{{ obj.trackId }}</el-tag>
             </div>
-            <div class="obj-sub">{{ dims(obj) }} · ry {{ (obj.ry * 57.2958).toFixed(0) }}°</div>
+            <div class="obj-sub">
+              {{ dims(obj) }}<template v-if="obj.shape !== 'line' && obj.shape !== 'arrow'">
+                · ry {{ (obj.ry * 57.2958).toFixed(0) }}°</template>
+            </div>
           </div>
           <el-button link type="danger" @click.stop="remove(obj)">
             <el-icon><Close /></el-icon>

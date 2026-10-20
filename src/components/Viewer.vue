@@ -16,6 +16,10 @@ import {
   selectObject,
   updateObject,
   loadLocalFiles,
+  addPolyline,
+  setPolylinePoint,
+  deletePolylinePoint,
+  setTool,
 } from '../stores/useAnnotationStore.js'
 
 const viewportEl = ref(null)
@@ -27,11 +31,36 @@ let loadToken = 0 // 用于丢弃过期的异步加载结果（快速切帧时�
 let fitPending = true // 新数据集加载后是否需要自动适应视角
 let currentSketch = null
 
-/** 把当前帧对象同步到视口，并刷新编辑手柄 */
+/** 把当前帧对象（3D 框 + 标线）同步到视口，并刷新编辑手柄 */
 function syncBoxes() {
   if (!viewer) return
-  viewer.syncBoxes(currentObjects.value, state.classes, state.selectedObjectId)
+  const boxObjects = currentObjects.value.filter((o) => o.shape !== 'line' && o.shape !== 'arrow')
+  viewer.syncBoxes(boxObjects, state.classes, state.selectedObjectId)
+  viewer.syncMarks(currentObjects.value, state.classes, state.selectedObjectId)
   applyGizmo()
+}
+
+/** 把绘制选项同步到视口 */
+function applyDrawOptions() {
+  if (!viewer) return
+  viewer.setDrawOptions({
+    width: state.tool === 'arrow' ? state.arrowWidth : state.lineWidth,
+    template: state.arrowTemplate,
+    heading: state.drawHeading,
+    groundZ: -state.sensorHeight,
+  })
+}
+
+/** 绘制完成 → 生成标线对象 */
+function onDrawFinish(draft) {
+  addPolyline(
+    {
+      ...draft,
+      classId: state.activeClassId,
+    },
+    { propagate: state.multiFrame },
+  )
+  state.draftCount = 0
 }
 
 /** 仅当选中对象且工具为变换类时才挂载手柄 */
@@ -39,7 +68,8 @@ function applyGizmo() {
   if (!viewer) return
   const transformTools = ['translate', 'rotate', 'scale']
   const obj = selectedObject.value
-  if (obj && transformTools.includes(state.tool)) viewer.attachGizmo(obj.id)
+  const isMark = obj?.shape === 'line' || obj?.shape === 'arrow'
+  if (obj && !isMark && transformTools.includes(state.tool)) viewer.attachGizmo(obj.id)
   else viewer.attachGizmo(null)
 }
 
@@ -158,6 +188,19 @@ onMounted(() => {
     },
     getClasses: () => state.classes, // 供标签着色使用
     getActiveClassId: () => state.activeClassId, // 自动赋标签所用类别
+    // 标线绘制
+    onDrawFinish,
+    onDrawChange: (count) => {
+      state.draftCount = count
+    },
+    onVertexChange: (objId, index, point, pathIndex) => {
+      setPolylinePoint(objId, index, point, pathIndex)
+      // 拖动过程中也实时刷新标线几何（顶点手柄保持不重建）
+      syncBoxes()
+    },
+    onVertexDelete: (objId, index, pathIndex) => {
+      deletePolylinePoint(objId, index, pathIndex)
+    },
   })
   viewerRef.current = viewer
   loadCurrent()
@@ -185,15 +228,27 @@ watch(
 watch(
   () => [state.selectedObjectId, state.tool],
   () => {
-    if (viewer) viewer.setGizmoMode(state.tool)
-    applyGizmo()
+    if (!viewer) return
+    viewer.setGizmoMode(state.tool)
+    viewer.setDrawMode(state.tool === 'line' || state.tool === 'arrow' ? state.tool : null)
+    applyDrawOptions()
+    // 选中变化也要刷新标线顶点手柄（syncBoxes 内部会调用 applyGizmo）
+    syncBoxes()
   },
 )
 
 watch(() => state.colorMode, (mode) => viewer?.setColorMode(mode))
 watch(() => state.pointSize, (size) => viewer?.setPointSize(size))
 watch(() => state.backgroundColor, (color) => viewer?.setBackground(color))
-watch(() => state.segEnabled, (on) => viewer?.setSegEnabled(on))
+watch(
+  () => [state.lineWidth, state.arrowWidth, state.arrowTemplate, state.drawHeading, state.sensorHeight, state.tool],
+  () => applyDrawOptions(),
+)
+watch(() => state.segEnabled, (on) => {
+  // 分割与标线绘制互斥：开启分割时退出绘制
+  if (on && (state.tool === 'line' || state.tool === 'arrow')) setTool('select')
+  viewer?.setSegEnabled(on)
+})
 watch(() => state.segMode, (mode) => viewer?.setSegMode(mode))
 watch(() => state.segOverwrite, (v) => viewer?.setSegOverwrite(v))
 watch(() => state.brushSize, (size) => viewer?.setBrushSize(size))
@@ -215,6 +270,7 @@ onBeforeUnmount(() => {
   <div
     ref="viewportEl"
     class="viewport"
+    :class="{ 'is-drawing': state.tool === 'line' || state.tool === 'arrow' }"
     v-loading="state.loading"
     element-loading-text="加载点云…"
     element-loading-background="rgba(13, 17, 23, 0.55)"
