@@ -8,6 +8,7 @@
 import { ref, watch, computed } from 'vue'
 import { ElMessage } from 'element-plus'
 import { state, classById } from '../stores/useAnnotationStore.js'
+import { canEditCurrentFrame } from '../stores/useReviewStore.js'
 import { viewerRef } from '../three/viewerRef.js'
 import { downloadJson } from '../utils/io.js'
 
@@ -122,9 +123,13 @@ const lastLabelName = computed(() => classById(state.lastLabel?.classId)?.name |
   <div class="section">
     <h3 class="section-title">
       <span>点级语义分割</span>
-      <el-switch v-model="state.segEnabled" size="small" />
+      <el-switch v-model="state.segEnabled" size="small" :disabled="!canEditCurrentFrame" />
     </h3>
 
+    <div v-if="!canEditCurrentFrame" class="hint props-lock-tip">
+      本帧已提交/已通过，分割面板只读
+    </div>
+    <div :class="{ 'props-locked': !canEditCurrentFrame }">
     <!-- 选中标签的编辑区：不依赖分割开关，只要选中了标签就能改/删 -->
     <div v-if="state.selectedSegment" class="segment-edit">
       <div class="field" style="margin-bottom: 8px">
@@ -197,6 +202,7 @@ const lastLabelName = computed(() => classById(state.lastLabel?.classId)?.name |
     </template>
     <div v-else class="hint">
       开启后可用矩形/画笔/套索给点云打语义标签，松开鼠标即生成；单击已标注的点可选中编辑。
+    </div>
     </div>
   </div>
 </template>

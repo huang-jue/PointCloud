@@ -35,4 +35,10 @@ if (import.meta.env.DEV) {
   import('./utils/save.js').then((m) => {
     window.__save = m
   })
+  import('./stores/useAuthStore.js').then((m) => {
+    window.__auth = m
+  })
+  import('./stores/useReviewStore.js').then((m) => {
+    window.__review = m
+  })
 }

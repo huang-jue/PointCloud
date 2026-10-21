@@ -23,6 +23,7 @@ import {
   scalePolyline,
 } from '../stores/useAnnotationStore.js'
 import { viewerRef } from '../three/viewerRef.js'
+import { canEditCurrentFrame } from '../stores/useReviewStore.js'
 import { radToDeg, degToRad } from '../utils/math.js'
 import { polylineLength } from '../utils/polyline.js'
 
@@ -142,6 +143,10 @@ function syncForward() {
         <span style="margin-left: 4px">居中</span>
       </el-button>
     </h3>
+    <div v-if="!canEditCurrentFrame && selection.length" class="hint props-lock-tip">
+      本帧已提交/已通过，属性面板只读
+    </div>
+    <div :class="{ 'props-locked': !canEditCurrentFrame }">
     <el-empty
       v-if="!selection.length"
       :image-size="50"
@@ -298,5 +303,6 @@ function syncForward() {
         <el-button size="small" @click="syncForward">同步本帧位姿到后续帧</el-button>
       </div>
     </template>
+    </div>
   </div>
 </template>

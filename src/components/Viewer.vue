@@ -1,13 +1,14 @@
-<script setup>
+﻿<script setup>
 /**
  * Viewer —— 3D 视口组件
  * 负责：创建/销毁 PointCloudViewer 实例，把 store 的状态变化同步到 three 视口，
  * 并把视口回调（选中、gizmo 变更、框选图形、选中点数）写回 store。
  * 另外用一个 2D 覆盖层 canvas 绘制分割框选时的矩形/套索。
  */
-import { ref, watch, onMounted, onBeforeUnmount, nextTick } from 'vue'
+import { ref, computed, watch, onMounted, onBeforeUnmount, nextTick } from 'vue'
 import { PointCloudViewer } from '../three/PointCloudViewer.js'
 import { viewerRef } from '../three/viewerRef.js'
+import { canEditCurrentFrame, reviewState } from '../stores/useReviewStore.js'
 import {
   state,
   currentFrame,
@@ -32,6 +33,14 @@ const dragging = ref(false)
 const perfEnabled = new URLSearchParams(location.search).has('perf')
 const perfText = ref('')
 let perfTimer = null
+
+/** 没有关联到具体对象的帧级批注，在视口右上角显示最新一条 */
+const frameOnlyComments = computed(() =>
+  reviewState.comments.filter(
+    (c) => c.frameIndex === state.currentIndex && !c.objectId && !c.resolved,
+  ),
+)
+const frameCommentLatest = computed(() => frameOnlyComments.value[frameOnlyComments.value.length - 1] || null)
 
 let viewer = null
 let loadToken = 0 // 用于丢弃过期的异步加载结果（快速切帧时）
@@ -77,6 +86,12 @@ function syncBoxes() {
   viewer.syncBoxes(boxObjects, state.classes, state.selectedObjectIds)
   viewer.syncMarks(currentObjects.value, state.classes, state.selectedObjectIds)
   applyGizmo()
+  // 对象位置/数量变化后同步批注气泡（已解决的批注不再显示）
+  viewer.syncCommentLabels(
+    reviewState.comments.filter((c) => !c.resolved),
+    currentObjects.value,
+    state.currentIndex,
+  )
 }
 
 /** 把绘制选项同步到视口 */
@@ -105,6 +120,10 @@ function onDrawFinish(draft) {
 /** 仅当选中对象且工具为变换类时才挂载手柄 */
 function applyGizmo() {
   if (!viewer) return
+  if (!canEditCurrentFrame.value) {
+    viewer.attachGizmo(null)
+    return
+  }
   const objects = selectedObjects.value
   if (objects.length > 1) {
     // 多选只支持整体平移；旋转/缩放请单个编辑
@@ -286,6 +305,7 @@ onMounted(() => {
     },
   })
   viewerRef.current = viewer
+  viewer.setReadOnly(!canEditCurrentFrame.value)
   viewer.setSnapEnabled(state.snapToPoints)
   if (perfEnabled) {
     perfTimer = setInterval(() => {
@@ -329,6 +349,25 @@ watch(
   },
 )
 
+watch(canEditCurrentFrame, (allowed) => {
+  viewer?.setReadOnly(!allowed)
+  if (!allowed) {
+    viewer?.setDrawMode(null)
+    viewer?.setSegEnabled(false)
+  }
+  syncBoxes()
+})
+watch(
+  () => reviewState.comments,
+  () => {
+    viewer?.syncCommentLabels(
+      reviewState.comments.filter((c) => !c.resolved),
+      currentObjects.value,
+      state.currentIndex,
+    )
+  },
+  { deep: true },
+)
 watch(() => state.colorMode, (mode) => viewer?.setColorMode(mode))
 watch(() => state.pointSize, (size) => viewer?.setPointSize(size))
 watch(() => state.backgroundColor, (color) => viewer?.setBackground(color))
@@ -383,6 +422,13 @@ onBeforeUnmount(() => {
     <!-- 分割框选可视化层：pointer-events 由样式置为 none，不拦截视口交互 -->
     <canvas ref="sketchEl" class="sketch"></canvas>
     <div v-if="perfEnabled" class="perf-overlay">{{ perfText }}</div>
+    <div v-if="frameCommentLatest" class="frame-comment-badge">
+      <div class="frame-comment-head">
+        本帧批注 · {{ frameCommentLatest.author }}
+        <span v-if="frameOnlyComments.length > 1">+{{ frameOnlyComments.length - 1 }}</span>
+      </div>
+      <div class="frame-comment-text">{{ frameCommentLatest.text }}</div>
+    </div>
     <div v-if="!state.loadingVisible && !state.frames.length" class="overlay">
       <div class="badge">拖入 .pcd / .ply / .bin / .las 文件，或从工具栏加载示例数据</div>
     </div>

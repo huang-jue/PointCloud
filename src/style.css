@@ -140,6 +140,55 @@ body {
   flex: 1;
   min-width: 0;
   background: var(--bg-0);
+  overflow: hidden;
+}
+
+/* 视口中的批注气泡（CSS2D，始终面向屏幕） */
+.pc-comment-label {
+  max-width: 230px;
+  padding: 5px 8px;
+  border-radius: 6px;
+  background: rgba(16, 22, 30, 0.94);
+  border: 1px solid rgba(255, 209, 102, 0.65);
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.45);
+  color: var(--text);
+  font-size: 11px;
+  line-height: 1.45;
+  pointer-events: none;
+  white-space: normal;
+  transform-origin: 50% 100%;
+}
+
+.pc-comment-label.is-rejection {
+  border-color: rgba(255, 107, 107, 0.8);
+  background: rgba(52, 18, 22, 0.95);
+}
+
+.pc-comment-label-head {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin-bottom: 2px;
+  color: var(--accent);
+  font-size: 10px;
+  font-weight: 600;
+}
+
+.pc-comment-label.is-rejection .pc-comment-label-head {
+  color: var(--danger);
+}
+
+.pc-comment-label-more {
+  color: var(--text-dim);
+  font-weight: 400;
+}
+
+.pc-comment-label-text {
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  word-break: break-word;
 }
 
 .viewport canvas {
@@ -175,6 +224,46 @@ body {
   padding: 8px 14px;
   border-radius: 8px;
   font-size: 12px;
+}
+
+.frame-comment-badge {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  z-index: 4;
+  max-width: 260px;
+  padding: 6px 9px;
+  border-radius: 6px;
+  background: rgba(16, 22, 30, 0.94);
+  border: 1px solid rgba(255, 209, 102, 0.65);
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.45);
+  color: var(--text);
+  font-size: 11px;
+  line-height: 1.45;
+  pointer-events: none;
+}
+
+.frame-comment-head {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin-bottom: 3px;
+  color: var(--accent);
+  font-size: 10px;
+  font-weight: 600;
+}
+
+.frame-comment-head span {
+  color: var(--text-dim);
+  font-weight: 400;
+}
+
+.frame-comment-text {
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  word-break: break-word;
 }
 
 .perf-overlay {
@@ -215,7 +304,7 @@ body {
 .toolbar-main {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 8px;
   padding: 8px 12px;
   flex-wrap: wrap;
   min-height: 52px;
@@ -476,6 +565,33 @@ body {
   background: var(--accent);
 }
 
+.tick.has-comments::before {
+  content: '';
+  position: absolute;
+  top: 3px;
+  left: 50%;
+  width: 4px;
+  height: 4px;
+  margin-left: -2px;
+  border-radius: 50%;
+  background: var(--warning, #e6a23c);
+}
+
+.tick.status-submitted {
+  background: rgba(230, 162, 60, 0.32);
+  border-color: rgba(230, 162, 60, 0.75);
+}
+
+.tick.status-approved {
+  background: rgba(87, 217, 163, 0.28);
+  border-color: rgba(87, 217, 163, 0.75);
+}
+
+.tick.status-rejected {
+  background: rgba(255, 107, 107, 0.28);
+  border-color: rgba(255, 107, 107, 0.75);
+}
+
 .tick.current {
   background: var(--accent-dim);
   border-color: var(--accent);
@@ -503,4 +619,14 @@ body {
 
 .hidden-input {
   display: none;
+}
+
+.props-locked {
+  pointer-events: none;
+  opacity: 0.62;
+}
+
+.props-lock-tip {
+  margin-bottom: 6px;
+  color: var(--warning, #e6a23c);
 }

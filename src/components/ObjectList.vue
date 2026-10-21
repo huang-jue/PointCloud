@@ -16,6 +16,7 @@ import {
 import { viewerRef } from '../three/viewerRef.js'
 import { requestRemoveObject } from '../utils/actions.js'
 import { polylineLength } from '../utils/polyline.js'
+import { canEditCurrentFrame } from '../stores/useReviewStore.js'
 
 let anchorId = null
 
@@ -141,7 +142,7 @@ function remove(obj) {
                 · ry {{ (obj.ry * 57.2958).toFixed(0) }}°</template>
             </div>
           </div>
-          <el-button link type="danger" @click.stop="remove(obj)">
+          <el-button v-if="canEditCurrentFrame" link type="danger" @click.stop="remove(obj)">
             <el-icon><Close /></el-icon>
           </el-button>
         </div>

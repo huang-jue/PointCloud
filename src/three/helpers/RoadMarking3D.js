@@ -65,6 +65,7 @@ export class RoadMarking3D {
     this.color = color
     this.shape = 'line'
     this.width = 0.15
+    this.paths = []
   }
 
   setColor(color) {
@@ -85,6 +86,9 @@ export class RoadMarking3D {
     this.objectId = obj.id
     const shape = obj.shape === 'arrow' ? 'arrow' : 'line'
     const width = obj.width ?? (shape === 'arrow' ? 0.35 : 0.15)
+    const paths = shape === 'line' ? [obj.points || []] : obj.paths || []
+    // 保留世界坐标路径，供屏幕空间拾取使用（远处窄标线也能点中）
+    this.paths = paths
 
     // 几何未变时跳过重建（拖动顶点会高频触发同步，避免反复分配 GPU 缓冲）
     const key = geometryKey(obj, shape, width)
@@ -92,7 +96,6 @@ export class RoadMarking3D {
       this._geoKey = key
       this.shape = shape
       this.width = width
-      const paths = shape === 'line' ? [obj.points || []] : obj.paths || []
       const withHead = shape === 'arrow'
       const display = buildMarkingGeometry(paths, width, withHead)
       const pick = buildMarkingGeometry(paths, width + PICK_EXTRA_WIDTH, withHead)

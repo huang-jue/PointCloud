@@ -1,4 +1,4 @@
-<script setup>
+﻿<script setup>
 /**
  * Toolbar —— 顶部工具栏
  *  - 加载示例数据集（下拉）、加载本地文件
@@ -24,7 +24,15 @@ import { ACCEPT } from '../three/loaders/index.js'
 import { downloadJson, downloadText, pickFile } from '../utils/io.js'
 import { requestRemoveObjects } from '../utils/actions.js'
 import { buildSavePayload, summarizePayload, saveToServer, isSaveConfigured } from '../utils/save.js'
+import {
+  applyReview,
+  canEditCurrentFrame,
+  resetFramesAfterImport,
+  resetReview,
+  serializeReview,
+} from '../stores/useReviewStore.js'
 import { withLoading } from '../utils/http.js'
+import { authState, currentRole, openLogin, logout, roleLabel } from '../stores/useAuthStore.js'
 
 const fileInput = ref(null)
 const datasets = ref([]) // 示例数据集列表（来自 index.json）
@@ -129,6 +137,15 @@ function onDataCommand(command) {
   else if (String(command).startsWith('sample:')) loadDataset(String(command).slice(7))
 }
 
+/** 用户菜单：切换用户 / 退出 */
+function onUserCommand(command) {
+  if (command === 'switch') openLogin()
+  else if (command === 'logout') {
+    logout()
+    openLogin()
+  }
+}
+
 /** “更多”菜单：低频操作收进下拉，减少顶部视觉噪音 */
 function onMoreCommand(command) {
   switch (command) {
@@ -146,6 +163,9 @@ function onMoreCommand(command) {
       break
     case 'export-project':
       exportProject()
+      break
+    case 'reset-review':
+      resetAllReview()
       break
     default:
       break
@@ -205,6 +225,10 @@ function copySelection() {
 }
 
 function pasteSelection({ inPlace = false } = {}) {
+  if (!canEditCurrentFrame.value) {
+    ElMessage.warning('当前帧已提交/已通过，暂不可编辑')
+    return
+  }
   const n = pasteObjects({ inPlace })
   if (n) ElMessage.success(`已粘贴 ${n} 个对象`)
   else ElMessage.info('剪贴板为空')
@@ -212,8 +236,10 @@ function pasteSelection({ inPlace = false } = {}) {
 
 /** 导出整个项目标注为 JSON */
 function exportProject() {
-  downloadJson(`${state.datasetName || 'annotation'}.json`, store.serializeProject())
-  ElMessage.success('标注已导出')
+  const data = store.serializeProject()
+  data.review = serializeReview()
+  downloadJson(`${state.datasetName || 'annotation'}.json`, data)
+  ElMessage.success('标注与批注已导出')
 }
 
 /**
@@ -230,7 +256,7 @@ async function save() {
     // 纯静态演示：直接导出紧凑 JSON（含所有帧框/标线 + 已编辑的点标签）
     downloadText(filename, JSON.stringify(payload), 'application/json')
     ElMessage.success(
-      `已导出：${info.frames} 帧 / ${info.boxes} 框 / ${info.lines} 线 / ${info.arrows} 箭头 / ${info.labeledFrames} 帧点标签`,
+      `已导出：${info.frames} 帧 / ${info.boxes} 框 / ${info.lines} 线 / ${info.arrows} 箭头 / ${info.labeledFrames} 帧点标签 / ${info.comments} 条批注`,
     )
     return
   }
@@ -252,8 +278,15 @@ async function importProject() {
   const [file] = await pickFile('.json,application/json')
   if (!file) return
   try {
-    store.applyProject(JSON.parse(await file.text()))
-    ElMessage.success('标注已导入')
+    const data = JSON.parse(await file.text())
+    const matched = store.applyProject(data)
+    if (data.review) {
+      applyReview(data.review)
+    } else {
+      const reset = resetFramesAfterImport(matched, '导入标注')
+      if (reset) ElMessage.info(`已重置 ${reset} 个已提交/已通过帧的审核状态`)
+    }
+    ElMessage.success(data.review ? '标注与批注已导入' : '标注已导入')
   } catch (err) {
     ElMessage.error(`导入失败: ${err.message}`)
   }
@@ -272,9 +305,11 @@ function exportKitti() {
 async function importGroundTruth() {
   if (!state.groundTruthUrl) return
   try {
-    await ElMessageBox.confirm('将覆盖所有帧当前的标注对象，确定重新导入全量真值？', '重新导入真值', {
-      type: 'warning',
-    })
+    await ElMessageBox.confirm(
+      '将覆盖所有帧当前的标注对象；已提交/已通过的帧会重置为未提交。确定重新导入全量真值？',
+      '重新导入真值',
+      { type: 'warning' },
+    )
   } catch {
     return
   }
@@ -282,7 +317,13 @@ async function importGroundTruth() {
     store.cancelScheduledGroundTruth()
     state.gtLoading = true
     const count = await store.importAllGroundTruth()
-    ElMessage.success(`已重新导入全量真值 ${count.toLocaleString()} 个对象`)
+    const reset = resetFramesAfterImport(
+      state.frames.map((_, index) => index),
+      '重新导入真值',
+    )
+    ElMessage.success(
+      `已重新导入全量真值 ${count.toLocaleString()} 个对象${reset ? `，重置 ${reset} 帧审核状态` : ''}`,
+    )
   } catch (err) {
     ElMessage.error(`真值导入失败: ${err.message}`)
   } finally {
@@ -298,6 +339,22 @@ async function clearFrame() {
   } catch {
     /* 用户取消 */
   }
+}
+
+/** 清空当前数据集的批注与审核记录（演示重跑用） */
+async function resetAllReview() {
+  if (!state.frames.length) return
+  try {
+    await ElMessageBox.confirm(
+      '将清空当前数据集的所有批注、审核状态与历史；标注数据不受影响。确定重置？',
+      '重置批注与审核',
+      { type: 'warning', confirmButtonText: '重置', cancelButtonText: '取消' },
+    )
+  } catch {
+    return
+  }
+  resetReview()
+  ElMessage.success('批注与审核记录已重置')
 }
 </script>
 
@@ -332,11 +389,11 @@ async function clearFrame() {
       </el-dropdown>
       <input ref="fileInput" class="hidden-input" type="file" multiple :accept="ACCEPT" @change="onFiles" />
 
-      <el-radio-group :model-value="state.tool" size="default" @change="setTool">
+      <el-radio-group :model-value="state.tool" size="default" :disabled="!canEditCurrentFrame" @change="setTool">
         <el-radio-button v-for="t in TOOLS" :key="t.id" :value="t.id">{{ t.label }}</el-radio-button>
       </el-radio-group>
 
-      <el-button type="primary" :disabled="!state.frames.length" @click="addBox">
+      <el-button type="primary" :disabled="!state.frames.length || !canEditCurrentFrame" @click="addBox">
         <el-icon><Plus /></el-icon>
         <span>添加框</span>
       </el-button>
@@ -351,7 +408,7 @@ async function clearFrame() {
           <el-icon><CopyDocument /></el-icon>
         </el-button>
         <el-button
-          :disabled="!state.clipboardCount"
+          :disabled="!state.clipboardCount || !canEditCurrentFrame"
           title="粘贴 (Ctrl+V)"
           aria-label="粘贴"
           @click="pasteSelection()"
@@ -359,7 +416,7 @@ async function clearFrame() {
           <el-icon><DocumentCopy /></el-icon>
         </el-button>
         <el-button
-          :disabled="!selectedObjects.length"
+          :disabled="!selectedObjects.length || !canEditCurrentFrame"
           title="删除 (Delete)"
           aria-label="删除"
           @click="deleteSelected"
@@ -370,7 +427,7 @@ async function clearFrame() {
 
       <el-popover placement="bottom-start" :width="300" trigger="click">
         <template #reference>
-          <el-button :type="multiActive ? 'primary' : ''" :plain="multiActive">
+          <el-button :type="multiActive ? 'primary' : ''" :plain="multiActive" :disabled="!canEditCurrentFrame">
             <el-icon><Connection /></el-icon>
             <span>多帧</span>
           </el-button>
@@ -394,6 +451,26 @@ async function clearFrame() {
       </el-popover>
 
       <div class="spacer"></div>
+
+      <el-dropdown v-if="authState.user" trigger="click" @command="onUserCommand">
+        <el-button :title="`${authState.user.name} · ${roleLabel(authState.user.role)}`">
+          <el-icon><User /></el-icon>
+          <span>{{ authState.user.name }}</span>
+        </el-button>
+        <template #dropdown>
+          <el-dropdown-menu>
+            <el-dropdown-item disabled>
+              当前角色：{{ roleLabel(authState.user.role) }}
+            </el-dropdown-item>
+            <el-dropdown-item divided command="switch">切换用户 / 角色</el-dropdown-item>
+            <el-dropdown-item command="logout">退出登录</el-dropdown-item>
+          </el-dropdown-menu>
+        </template>
+      </el-dropdown>
+      <el-button v-else @click="openLogin">
+        <el-icon><User /></el-icon>
+        <span>登录</span>
+      </el-button>
 
       <el-popover placement="bottom-end" :width="260" trigger="click">
         <template #reference>
@@ -426,33 +503,48 @@ async function clearFrame() {
       </el-popover>
 
       <el-dropdown trigger="click" @command="onMoreCommand">
-        <el-button>
+        <el-button title="更多操作" aria-label="更多操作">
           <el-icon><MoreFilled /></el-icon>
-          <span>更多</span>
         </el-button>
         <template #dropdown>
           <el-dropdown-menu>
-            <el-dropdown-item command="groundtruth" :disabled="!state.groundTruthUrl">
+            <el-dropdown-item
+              command="groundtruth"
+              :disabled="!state.groundTruthUrl || !canEditCurrentFrame"
+            >
               重新导入真值
             </el-dropdown-item>
             <el-dropdown-item command="kitti" :disabled="!state.frames.length">
               导出 KITTI
             </el-dropdown-item>
-            <el-dropdown-item command="clear" :disabled="!state.frames.length">
+            <el-dropdown-item command="clear" :disabled="!state.frames.length || !canEditCurrentFrame">
               清空本帧
             </el-dropdown-item>
-            <el-dropdown-item divided command="import-project">导入标注</el-dropdown-item>
+            <el-dropdown-item divided command="import-project" :disabled="!canEditCurrentFrame">
+              导入标注
+            </el-dropdown-item>
             <el-dropdown-item command="export-project" :disabled="!state.frames.length">
               导出标注（项目 JSON）
+            </el-dropdown-item>
+            <el-dropdown-item
+              v-if="currentRole === 'admin'"
+              divided
+              command="reset-review"
+              :disabled="!state.frames.length"
+            >
+              重置批注与审核
             </el-dropdown-item>
           </el-dropdown-menu>
         </template>
       </el-dropdown>
 
-      <el-tooltip placement="bottom" content="导出所有帧的框/标线与已编辑的点级标签为 JSON">
+      <el-tooltip
+        placement="bottom"
+        content="导出所有帧的框/标线、已编辑点标签与批注/审核记录为 JSON"
+      >
         <el-button type="primary" :loading="saving" :disabled="!state.frames.length" @click="save">
           <el-icon><Download /></el-icon>
-          <span>导出数据</span>
+          <span>导出</span>
         </el-button>
       </el-tooltip>
     </div>

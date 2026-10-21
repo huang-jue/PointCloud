@@ -6,6 +6,7 @@
  */
 import { ref, computed, watch, onBeforeUnmount } from 'vue'
 import { state, currentFrame, store } from '../stores/useAnnotationStore.js'
+import { commentCountForFrame, frameStatus, statusLabelOf } from '../stores/useReviewStore.js'
 
 const fps = ref(8)
 let timer = null
@@ -13,6 +14,19 @@ let timer = null
 const maxIndex = computed(() => Math.max(0, state.frames.length - 1))
 // 帧数过多时不渲染刻度条，避免 DOM 过重
 const showTicks = computed(() => state.frames.length > 0 && state.frames.length <= 120)
+
+/** 每个刻度的审核状态与批注数（一次性算好，避免模板里反复过滤） */
+const tickMeta = computed(() =>
+  state.frames.map((frame, index) => {
+    const status = frameStatus(index)
+    const comments = commentCountForFrame(index)
+    return {
+      status,
+      comments,
+      title: `${frame.name} · ${statusLabelOf(status)}${comments ? ` · ${comments} 条批注` : ''}`,
+    }
+  }),
+)
 
 function setIndex(value) {
   store.setCurrentIndex(Number(value))
@@ -110,8 +124,15 @@ onBeforeUnmount(() => {
         v-for="(frame, i) in state.frames"
         :key="i"
         class="tick"
-        :class="{ current: i === state.currentIndex, 'has-objects': frame.objects.length }"
-        :title="frame.name"
+        :class="[
+          `status-${tickMeta[i].status}`,
+          {
+            current: i === state.currentIndex,
+            'has-objects': frame.objects.length,
+            'has-comments': tickMeta[i].comments > 0,
+          },
+        ]"
+        :title="tickMeta[i].title"
         @click="setIndex(i)"
       ></div>
     </div>

@@ -12,6 +12,8 @@ import ObjectList from './components/ObjectList.vue'
 import Properties from './components/Properties.vue'
 import ClassManager from './components/ClassManager.vue'
 import SegmentPanel from './components/SegmentPanel.vue'
+import CommentPanel from './components/CommentPanel.vue'
+import LoginDialog from './components/LoginDialog.vue'
 import Viewer from './components/Viewer.vue'
 import Timeline from './components/Timeline.vue'
 import StatusBar from './components/StatusBar.vue'
@@ -28,6 +30,25 @@ import {
 } from './stores/useAnnotationStore.js'
 import { viewerRef } from './three/viewerRef.js'
 import { requestRemoveObjects } from './utils/actions.js'
+import { ROLES, authState, canAnnotate, login, openLogin } from './stores/useAuthStore.js'
+import { canEditCurrentFrame } from './stores/useReviewStore.js'
+
+/** 角色切换或当前帧被锁定后退出绘制/分割，保持只读 */
+watch(canEditCurrentFrame, (allowed) => {
+  if (allowed) return
+  state.segEnabled = false
+  if (state.tool !== 'select') setTool('select')
+})
+
+/** 多帧传播跳过已锁定帧时给出一次汇总提示 */
+watch(
+  () => state.lockSkipCount,
+  (count) => {
+    if (!count) return
+    ElMessage.info(`已跳过 ${count} 个已提交/已通过帧`)
+    state.lockSkipCount = 0
+  },
+)
 
 /** 任意组件把错误写进 state.error，这里统一弹出并复位 */
 watch(
@@ -47,7 +68,7 @@ function isTyping(target) {
 
 /** 是否处于标线绘制中 */
 function isDrawing() {
-  return state.tool === 'line' || state.tool === 'arrow'
+  return canEditCurrentFrame.value && (state.tool === 'line' || state.tool === 'arrow')
 }
 
 /** 有手工标注/复制对象或编辑过点标签时，离开页面前提醒（演示环境不自动持久化） */
@@ -67,6 +88,16 @@ function onBeforeUnload(event) {
 
 function onKeydown(event) {
   if (isTyping(event.target)) return
+  const mod = event.ctrlKey || event.metaKey
+  // 批注员/未登录/当前帧已锁定：只保留浏览快捷键，禁止任何标注修改
+  if (!canEditCurrentFrame.value) {
+    const blocked = ['w', 'W', 'e', 'E', 'r', 'R', 'l', 'L', 'a', 'A', 'b', 'B', 'Delete', 'Backspace']
+    const blockedMod = ['z', 'Z', 'v', 'V', 'd', 'D']
+    if (blocked.includes(event.key) || (mod && blockedMod.includes(event.key))) {
+      event.preventDefault()
+      return
+    }
+  }
   // 绘制中：Enter 完成 / Esc 取消 / Backspace 退点
   if (isDrawing()) {
     if (event.key === 'Enter') {
@@ -85,7 +116,6 @@ function onKeydown(event) {
       return
     }
   }
-  const mod = event.ctrlKey || event.metaKey
   // Ctrl/Cmd+Z：撤销上一步点标签
   if (mod && (event.key === 'z' || event.key === 'Z')) {
     if (viewerRef.current?.undoLabel()) {
@@ -188,6 +218,18 @@ onMounted(() => {
   window.addEventListener('keydown', onKeydown)
   window.addEventListener('beforeunload', onBeforeUnload)
   const params = new URLSearchParams(location.search)
+  const urlUser = params.get('user')
+  const urlRole = params.get('role')
+  if (urlUser && ROLES.some((r) => r.id === urlRole)) {
+    // 演示用：?user=张三&role=reviewer 直接以指定身份进入（方便双标签演示）
+    try {
+      login(urlUser, urlRole)
+    } catch (err) {
+      state.error = err.message || String(err)
+    }
+  } else if (!authState.user) {
+    openLogin()
+  }
   const ds = params.get('dataset')
   if (!ds && !params.has('seq')) return
   const id = ds && ds !== 'sequence' ? ds : null
@@ -211,16 +253,20 @@ onBeforeUnmount(() => {
     <div class="app-body">
       <ObjectList />
       <Viewer />
-      <!-- 右侧面板：对象属性 / 类别管理 / 点级分割 -->
+      <!-- 右侧面板：批注审核 + 标注编辑（批注员只显示批注） -->
       <aside class="panel panel-right">
         <div class="panel-body">
-          <Properties />
-          <ClassManager />
-          <SegmentPanel />
+          <CommentPanel />
+          <template v-if="canAnnotate">
+            <Properties />
+            <ClassManager />
+            <SegmentPanel />
+          </template>
         </div>
       </aside>
     </div>
     <Timeline />
     <StatusBar />
+    <LoginDialog />
   </div>
 </template>

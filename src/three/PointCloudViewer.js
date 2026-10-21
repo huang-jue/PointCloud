@@ -21,6 +21,7 @@
 import * as THREE from 'three'
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js'
 import { TransformControls } from 'three/examples/jsm/controls/TransformControls.js'
+import { CSS2DObject, CSS2DRenderer } from 'three/examples/jsm/renderers/CSS2DRenderer.js'
 import { BBox3D } from './helpers/BBox3D.js'
 import { RoadMarking3D, buildMarkingGeometry } from './helpers/RoadMarking3D.js'
 import { loadPointCloud } from './loaders/index.js'
@@ -75,6 +76,17 @@ export class PointCloudViewer {
     this.renderer.setPixelRatio(this._pixelRatio())
     container.appendChild(this.renderer.domElement)
     this._perf = { fps: 0, frameMs: 0, frames: 0, last: performance.now() }
+
+    /* ---------- 批注标签（CSS2D，始终朝向屏幕） ---------- */
+    this.labelRenderer = new CSS2DRenderer()
+    const labelDom = this.labelRenderer.domElement
+    labelDom.style.position = 'absolute'
+    labelDom.style.inset = '0'
+    labelDom.style.pointerEvents = 'none'
+    labelDom.style.zIndex = '3'
+    labelDom.style.overflow = 'hidden'
+    container.appendChild(labelDom)
+    this.commentLabels = []
 
     /* ---------- 轨道控制器（左键平移 / 右键旋转） ---------- */
     this.controls = new OrbitControls(this.camera, this.renderer.domElement)
@@ -147,6 +159,7 @@ export class PointCloudViewer {
     }
     this.activeTool = 'select'
     this._scaleState = null
+    this.readOnly = false
 
     /* ---------- 编辑手柄（平移/旋转/缩放） ---------- */
     this.transform = new TransformControls(this.camera, this.renderer.domElement)
@@ -172,6 +185,10 @@ export class PointCloudViewer {
               return null
             })
             .filter(Boolean)
+          // 单条标线整体移动/旋转时，黄色顶点手柄不在 mark.group 下，需要单独跟随
+          this._handleStartPositions = this.vertexHandles
+            .filter((h) => this.groupGizmoIds.includes(h.userData.vertex?.objId))
+            .map((handle) => ({ handle, start: handle.position.clone() }))
         } else if (this._groupDragging) {
           this._groupDragging = false
           const ids = this.groupGizmoIds.slice()
@@ -180,6 +197,7 @@ export class PointCloudViewer {
             this._groupStart = null
             this._groupStartPositions = null
             this._groupRotateCenter = null
+            this._handleStartPositions = null
             this.callbacks.onGroupRotate?.(ids[0], angle)
           } else {
             const start = this._groupStart
@@ -190,6 +208,7 @@ export class PointCloudViewer {
             this._groupStart = null
             this._groupStartPositions = null
             this._groupRotateCenter = null
+            this._handleStartPositions = null
             this.callbacks.onGroupCommit?.(ids, { dx, dy, dz })
           }
         }
@@ -220,6 +239,11 @@ export class PointCloudViewer {
               0,
             )
           }
+          for (const { handle, start } of this._handleStartPositions || []) {
+            const rx = start.x - center.x
+            const ry = start.y - center.y
+            handle.position.set(center.x + rx * cos - ry * sin, center.y + rx * sin + ry * cos, start.z)
+          }
           return
         }
         const start = this._groupStart
@@ -230,6 +254,9 @@ export class PointCloudViewer {
         for (const item of this._groupStartPositions || []) {
           item.box?.group.position.set(item.start.x + dx, item.start.y + dy, item.start.z + dz)
           item.mark?.group.position.set(item.start.x + dx, item.start.y + dy, item.start.z + dz)
+        }
+        for (const { handle, start } of this._handleStartPositions || []) {
+          handle.position.set(start.x + dx, start.y + dy, start.z + dz)
         }
         return
       }
@@ -252,6 +279,7 @@ export class PointCloudViewer {
     this._groupMode = 'translate'
     this._groupStartRotation = 0
     this._groupRotateCenter = null
+    this._handleStartPositions = null
 
     /* ---------- 点云对象 ---------- */
     this.pointObject = null
@@ -328,6 +356,7 @@ export class PointCloudViewer {
     this.controls.update() // damping 需要每帧 update
     this._updateHandleScales()
     this.renderer.render(this.scene, this.camera)
+    this.labelRenderer.render(this.scene, this.camera)
     const perf = this._perf
     perf.frames++
     const dt = now - perf.last
@@ -380,6 +409,7 @@ export class PointCloudViewer {
     this.camera.updateProjectionMatrix()
     this.renderer.setPixelRatio(this._pixelRatio())
     this.renderer.setSize(w, h, false)
+    this.labelRenderer?.setSize(w, h)
   }
 
   /** 鼠标位置 -> 归一化设备坐标（NDC） */
@@ -399,7 +429,7 @@ export class PointCloudViewer {
   _onPointerDown(event) {
     this._down = { x: event.clientX, y: event.clientY, t: performance.now() }
     // 标线顶点拖动（选中标线后显示的手柄；绘制模式下不响应，避免误拖）
-    if (event.button === 0 && !this.drawMode && this.vertexHandles.length) {
+    if (event.button === 0 && !this.readOnly && !this.drawMode && this.vertexHandles.length) {
       const hit = this._pickVertex(event)
       if (hit) {
         if (event.altKey) {
@@ -413,14 +443,14 @@ export class PointCloudViewer {
       }
     }
     // 缩放工具：命中手柄则开始拖动缩放
-    if (this.activeTool === 'scale' && !this.segEnabled && event.button === 0) {
+    if (this.activeTool === 'scale' && !this.readOnly && !this.segEnabled && event.button === 0) {
       const idx = this._pickScaleHandle(event)
       if (idx !== -1) {
         this._startScale(idx)
         return
       }
     }
-    if (this.segEnabled && event.button === 0 && this.transform.axis === null && this.currentCloud) {
+    if (this.segEnabled && !this.readOnly && event.button === 0 && this.transform.axis === null && this.currentCloud) {
       this._selecting = true
       const p = this._localPoint(event)
       if (this.segMode === 'lasso') {
@@ -569,6 +599,13 @@ export class PointCloudViewer {
         return
       }
     }
+    // 远距离下标线的拾取面可能只有几个像素，补一层屏幕空间命中
+    const local = this._localPoint(event)
+    const markId = this._pickMarkAtScreen(local.x, local.y)
+    if (markId) {
+      this.callbacks.onSelect?.(markId, { additive })
+      return
+    }
     this.callbacks.onSelect?.(null, { additive })
   }
 
@@ -579,9 +616,19 @@ export class PointCloudViewer {
 
   /* ---------------- 路面标线：绘制 ---------------- */
 
+  /** 只读模式（批注员）：禁止所有几何修改 */
+  setReadOnly(readOnly) {
+    this.readOnly = !!readOnly
+    if (!this.readOnly) return
+    this.setDrawMode(null)
+    this.setSegEnabled(false)
+    this.attachGizmo(null)
+    this.showVertexHandles(null)
+  }
+
   /** 进入/退出绘制模式（左键留给落点） */
   setDrawMode(mode) {
-    const next = mode === 'line' || mode === 'arrow' ? mode : null
+    const next = !this.readOnly && (mode === 'line' || mode === 'arrow') ? mode : null
     if (next === this.drawMode) return
     this.drawMode = next
     this.drawPoints = []
@@ -796,6 +843,11 @@ export class PointCloudViewer {
         if (this.vertexObjectId === id) this.showVertexHandles(null)
       }
     }
+    // 只读角色不显示顶点手柄
+    if (this.readOnly) {
+      if (this.vertexObjectId) this.showVertexHandles(null)
+      return
+    }
     // 绘制过程中不显示顶点手柄，避免与落点混淆
     if (this.drawMode) {
       if (this.vertexObjectId) this.showVertexHandles(null)
@@ -813,6 +865,82 @@ export class PointCloudViewer {
       }
       this.showVertexHandles(sel)
     } else if (this.vertexObjectId) this.showVertexHandles(null)
+  }
+
+  /**
+   * 在当前帧的对象上显示批注气泡。
+   * 只有带 objectId 的批注才挂到具体标注上；同一对象显示最新一条并附带数量。
+   */
+  syncCommentLabels(comments, objects, frameIndex) {
+    this._clearCommentLabels()
+    if (!this.labelRenderer || !Array.isArray(comments) || !comments.length) return
+    const byObject = new Map()
+    for (const c of comments) {
+      if (c.frameIndex !== frameIndex || !c.objectId) continue
+      const entry = byObject.get(c.objectId)
+      if (!entry) byObject.set(c.objectId, { latest: c, count: 1 })
+      else {
+        entry.count++
+        if ((c.createdAt || 0) >= (entry.latest.createdAt || 0)) entry.latest = c
+      }
+    }
+    if (!byObject.size) return
+    const list = Array.isArray(objects) ? objects : []
+    for (const [objectId, info] of byObject) {
+      const obj = list.find((o) => o.id === objectId)
+      if (!obj) continue
+      let parent = null
+      let local = null
+      const box = this.boxes.get(objectId)
+      if (box) {
+        parent = box.group
+        local = new THREE.Vector3(0, 0, (obj.h || 1) / 2 + 0.45)
+      } else {
+        const mark = this.marks.get(objectId)
+        const center = mark?.center()
+        if (!mark || !center) continue
+        parent = mark.group
+        local = center.clone()
+        local.z += 0.7
+      }
+      const el = this._makeCommentElement(info.latest, info.count)
+      const label = new CSS2DObject(el)
+      label.center.set(0.5, 1)
+      label.position.copy(local)
+      parent.add(label)
+      this.commentLabels.push({ label, parent })
+    }
+  }
+
+  _makeCommentElement(comment, count) {
+    const el = document.createElement('div')
+    el.className = `pc-comment-label${comment.kind === 'rejection' ? ' is-rejection' : ''}`
+    el.title = comment.text || ''
+    const head = document.createElement('div')
+    head.className = 'pc-comment-label-head'
+    const author = document.createElement('span')
+    author.textContent = comment.author || '批注'
+    head.appendChild(author)
+    if (count > 1) {
+      const more = document.createElement('span')
+      more.className = 'pc-comment-label-more'
+      more.textContent = `+${count - 1}`
+      head.appendChild(more)
+    }
+    const text = document.createElement('div')
+    text.className = 'pc-comment-label-text'
+    text.textContent = comment.text || ''
+    el.appendChild(head)
+    el.appendChild(text)
+    return el
+  }
+
+  _clearCommentLabels() {
+    for (const { label } of this.commentLabels) {
+      label.removeFromParent()
+      label.element?.remove?.()
+    }
+    this.commentLabels = []
   }
 
   /** 仅更新已有顶点手柄的位置 */
@@ -1308,6 +1436,7 @@ export class PointCloudViewer {
     this._groupDragging = false
     this._groupStart = null
     this._groupStartPositions = null
+    this._handleStartPositions = null
     this._groupAllowZ = false
     this._groupMode = 'translate'
     this._groupStartRotation = 0
@@ -1320,6 +1449,12 @@ export class PointCloudViewer {
   attachGizmo(objectId) {
     this.detachGroupGizmo()
     this.gizmoObjectId = objectId
+    if (this.readOnly) {
+      this.gizmoObjectId = null
+      this.transform.detach()
+      this._refreshScaleHandles()
+      return
+    }
     const noGizmo = ['select', 'scale', 'line', 'arrow']
     const usable = objectId && this.boxes.has(objectId) && !noGizmo.includes(this.activeTool)
     if (usable) {
@@ -1349,6 +1484,7 @@ export class PointCloudViewer {
     this.transform.detach()
     this.gizmoObjectId = null
     this._refreshScaleHandles()
+    if (this.readOnly) return
     const unique = Array.from(new Set(ids || []))
     if (!unique.length) {
       this.detachGroupGizmo()
@@ -1537,7 +1673,7 @@ export class PointCloudViewer {
 
   /** 开关分割模式，并切换鼠标按键映射（左键让给框选） */
   setSegEnabled(enabled) {
-    this.segEnabled = !!enabled
+    this.segEnabled = !!enabled && !this.readOnly
     this.controls.mouseButtons = this.drawMode
       ? { ...MOUSE_DRAW }
       : this.segEnabled
@@ -1809,6 +1945,76 @@ export class PointCloudViewer {
   }
 
   /**
+   * 屏幕空间拾取标线：把每条标线路径投影到屏幕，按像素距离命中。
+   * 远处标线的射线拾取面可能只有几像素宽，这层兜底让箭头/细线仍然可点。
+   * @param {number} x 画布像素坐标
+   * @param {number} y 画布像素坐标
+   * @param {number} threshold 命中像素半径
+   * @returns {string|null} 标线对象 id
+   */
+  _pickMarkAtScreen(x, y, threshold = 14) {
+    if (!this.marks.size) return null
+    const W = this.renderer.domElement.clientWidth
+    const H = this.renderer.domElement.clientHeight
+    const t2 = threshold * threshold
+    let bestId = null
+    let bestD2 = t2
+    let bestZ = Infinity
+    const project = (p) => {
+      const v = this._projector.set(p[0], p[1], p[2] || 0).project(this.camera)
+      return { x: (v.x * 0.5 + 0.5) * W, y: (-v.y * 0.5 + 0.5) * H, z: v.z }
+    }
+    const distToSegment2 = (ax, ay, bx, by) => {
+      const vx = bx - ax
+      const vy = by - ay
+      const wx = x - ax
+      const wy = y - ay
+      const c1 = vx * wx + vy * wy
+      if (c1 <= 0) return wx * wx + wy * wy
+      const c2 = vx * vx + vy * vy
+      if (c2 <= c1) {
+        const dx = x - bx
+        const dy = y - by
+        return dx * dx + dy * dy
+      }
+      const t = c1 / c2
+      const dx = x - (ax + vx * t)
+      const dy = y - (ay + vy * t)
+      return dx * dx + dy * dy
+    }
+    for (const mark of this.marks.values()) {
+      const paths = mark.paths || []
+      for (const path of paths) {
+        if (!path?.length) continue
+        if (path.length === 1) {
+          const p = project(path[0])
+          if (p.z < -1 || p.z > 1) continue
+          const d2 = (p.x - x) ** 2 + (p.y - y) ** 2
+          if (d2 <= bestD2 && (d2 < bestD2 || p.z < bestZ)) {
+            bestD2 = d2
+            bestZ = p.z
+            bestId = mark.objectId
+          }
+          continue
+        }
+        for (let i = 1; i < path.length; i++) {
+          const a = project(path[i - 1])
+          const b = project(path[i])
+          if ((a.z < -1 || a.z > 1) && (b.z < -1 || b.z > 1)) continue
+          const d2 = distToSegment2(a.x, a.y, b.x, b.y)
+          const z = Math.min(a.z, b.z)
+          if (d2 <= bestD2 && (d2 < bestD2 || z < bestZ)) {
+            bestD2 = d2
+            bestZ = z
+            bestId = mark.objectId
+          }
+        }
+      }
+    }
+    return bestId
+  }
+
+  /**
    * 屏幕空间拾取最近的点（比射线拾取更可靠，点按像素尺寸渲染）
    * @param {number} radius 像素半径
    * @param {boolean} labeledOnly 只考虑已有标签的点（用于点击编辑标签）
@@ -2060,6 +2266,11 @@ export class PointCloudViewer {
     this.pointMaterial.dispose()
     this.grid.geometry.dispose()
     this.grid.material.dispose()
+    this._clearCommentLabels()
+    if (this.labelRenderer?.domElement?.parentNode) {
+      this.labelRenderer.domElement.parentNode.removeChild(this.labelRenderer.domElement)
+    }
+    this.labelRenderer = null
     this.renderer.dispose()
     if (this.renderer.domElement.parentNode) {
       this.renderer.domElement.parentNode.removeChild(this.renderer.domElement)

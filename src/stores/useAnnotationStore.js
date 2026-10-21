@@ -35,6 +35,7 @@ import { uid } from '../utils/id.js'
 import { pathExt } from '../utils/math.js'
 import { objectsToKittiText, kittiTextToObjects } from '../utils/kitti.js'
 import { get } from '../utils/http.js'
+import { isFrameLocked } from './reviewCore.js'
 import {
   clonePoints,
   clonePaths,
@@ -68,6 +69,16 @@ let groundTruthToken = 0 // 延迟导入全量真值的代次，切换数据集�
 
 function nextTrackId() {
   return ++trackSeq
+}
+
+/** 当前帧是否已提交/已通过（锁定） */
+function currentFrameLocked() {
+  return isFrameLocked(state.currentIndex)
+}
+
+/** 传播时遇到锁定帧：跳过并累计一次提示 */
+function noteLockedSkip() {
+  state.lockSkipCount++
 }
 
 export const state = reactive({
@@ -107,6 +118,7 @@ export const state = reactive({
   selectedObjectId: null, // 单选主对象（兼容原有属性面板/手柄逻辑）
   selectedObjectIds: [], // 多选集合（当前帧对象 id）
   clipboardCount: 0, // 内部剪贴板对象数
+  lockSkipCount: 0, // 多帧传播时跳过已提交/已通过帧的数量（供 UI 提示）
   gtLoading: false, // 正在加载全量真值
 
   /* 点级分割 */
@@ -331,7 +343,9 @@ export function loadLocalFiles(fileList) {
   const files = Array.from(fileList || [])
   if (!files.length) return
   reset()
-  state.datasetName = 'local'
+  // 用首个文件名区分不同的本地批次，避免复用上一次「local」的审核记录
+  state.datasetName =
+    files.length === 1 ? files[0].name : `local:${files[0].name}+${files.length - 1}`
   state.frames = files.map((file, i) => {
     const ext = pathExt(file.name) || 'bin'
     return {
@@ -389,7 +403,7 @@ export function bumpLabelVersion() {
  */
 export function addObject(partial, options = {}) {
   const frame = currentFrame.value
-  if (!frame) return null
+  if (!frame || currentFrameLocked()) return null
   const cls = activeClass.value
   const propagate = options.propagate ?? state.multiFrame
   const trackId = propagate ? nextTrackId() : (partial.trackId ?? 0)
@@ -413,6 +427,10 @@ export function addObject(partial, options = {}) {
   const last = propagate ? state.frames.length - 1 : state.currentIndex
   let first = null
   for (let j = state.currentIndex; j <= last; j++) {
+    if (j !== state.currentIndex && isFrameLocked(j)) {
+      noteLockedSkip()
+      continue
+    }
     const obj = { ...template, id: uid('obj') } // 每帧独立 id，靠 trackId 关联
     state.frames[j].objects.push(obj)
     if (!first) first = obj
@@ -434,7 +452,7 @@ export function addObject(partial, options = {}) {
  */
 export function addPolyline(partial, options = {}) {
   const frame = currentFrame.value
-  if (!frame) return null
+  if (!frame || currentFrameLocked()) return null
   const shape = partial.shape === 'arrow' ? 'arrow' : 'line'
   const clsName = partial.type || MARKING_CLASS[shape]
   let cls = partial.classId != null ? classById(partial.classId) : classByName(clsName)
@@ -460,6 +478,10 @@ export function addPolyline(partial, options = {}) {
   const last = propagate ? state.frames.length - 1 : state.currentIndex
   let first = null
   for (let j = state.currentIndex; j <= last; j++) {
+    if (j !== state.currentIndex && isFrameLocked(j)) {
+      noteLockedSkip()
+      continue
+    }
     const item = { ...template, id: uid('mark') }
     if (shape === 'line') item.points = clonePoints(template.points)
     else item.paths = clonePaths(template.paths)
@@ -484,6 +506,7 @@ export function isMarking(obj) {
  * @param {number} [pathIndex] 箭头路径索引（线忽略）
  */
 export function setPolylinePoint(id, index, point, pathIndex = 0) {
+  if (currentFrameLocked()) return
   const obj = currentObjects.value.find((o) => o.id === id)
   if (!isMarking(obj)) return
   const arr = obj.shape === 'line' ? obj.points : obj.paths?.[pathIndex]
@@ -494,6 +517,7 @@ export function setPolylinePoint(id, index, point, pathIndex = 0) {
 
 /** 删除标线的单个顶点（至少保留 2 个） */
 export function deletePolylinePoint(id, index, pathIndex = 0) {
+  if (currentFrameLocked()) return false
   const obj = currentObjects.value.find((o) => o.id === id)
   if (!isMarking(obj)) return false
   const arr = obj.shape === 'line' ? obj.points : obj.paths?.[pathIndex]
@@ -510,6 +534,7 @@ export function deletePolylinePoint(id, index, pathIndex = 0) {
  * @param {number} angle 弧度，正值逆时针（俯视）
  */
 export function rotatePolyline(id, angle) {
+  if (currentFrameLocked()) return
   const obj = currentObjects.value.find((o) => o.id === id)
   if (!isMarking(obj)) return
   if (obj.shape === 'line') {
@@ -523,6 +548,7 @@ export function rotatePolyline(id, angle) {
 
 /** 绕质心缩放标线 */
 export function scalePolyline(id, factor) {
+  if (currentFrameLocked()) return
   const obj = currentObjects.value.find((o) => o.id === id)
   if (!isMarking(obj)) return
   if (obj.shape === 'line') {
@@ -545,8 +571,15 @@ export function markingCentroid(obj) {
 function propagateMarkingChange(obj, { points, paths }) {
   if (!state.multiFrameMove || !obj.multiFrame || !(obj.trackId > 0)) return
   for (let j = state.currentIndex + 1; j < state.frames.length; j++) {
-    for (const o of state.frames[j].objects) {
-      if (o.trackId !== obj.trackId || !isMarking(o)) continue
+    const targets = state.frames[j].objects.filter(
+      (o) => o.trackId === obj.trackId && isMarking(o),
+    )
+    if (!targets.length) continue
+    if (isFrameLocked(j)) {
+      noteLockedSkip()
+      continue
+    }
+    for (const o of targets) {
       if (o.shape === 'line' && points) o.points = clonePoints(points)
       if (o.shape === 'arrow' && paths) o.paths = clonePaths(paths)
     }
@@ -580,6 +613,7 @@ export function setTool(tool) {
  * 同一 track 对象上（保持各帧之间的相对运动不被抹平）。
  */
 export function updateObject(id, patch) {
+  if (currentFrameLocked()) return
   const obj = currentObjects.value.find((o) => o.id === id)
   if (!obj) return
   // 记录变更前的值，用于计算增量
@@ -602,8 +636,15 @@ export function updateObject(id, patch) {
     }
     if (state.multiFrameMove && obj.multiFrame && obj.trackId > 0) {
       for (let j = state.currentIndex + 1; j < state.frames.length; j++) {
-        for (const o of state.frames[j].objects) {
-          if (o.trackId !== obj.trackId || !isMarking(o)) continue
+        const targets = state.frames[j].objects.filter(
+          (o) => o.trackId === obj.trackId && isMarking(o),
+        )
+        if (!targets.length) continue
+        if (isFrameLocked(j)) {
+          noteLockedSkip()
+          continue
+        }
+        for (const o of targets) {
           if (patch.classId !== undefined) o.classId = obj.classId
           if (patch.type !== undefined) o.type = obj.type
           if (patch.width !== undefined) o.width = obj.width
@@ -621,8 +662,13 @@ export function updateObject(id, patch) {
 /** 把 patch 的增量应用到之后所有帧中同一 trackId 的对象 */
 function propagateDeltaToTrack(obj, patch, before) {
   for (let j = state.currentIndex + 1; j < state.frames.length; j++) {
-    for (const o of state.frames[j].objects) {
-      if (o.trackId !== obj.trackId) continue
+    const targets = state.frames[j].objects.filter((o) => o.trackId === obj.trackId)
+    if (!targets.length) continue
+    if (isFrameLocked(j)) {
+      noteLockedSkip()
+      continue
+    }
+    for (const o of targets) {
       for (const k of Object.keys(patch)) {
         if (typeof patch[k] === 'number' && typeof before[k] === 'number') {
           o[k] = o[k] + (patch[k] - before[k])
@@ -647,13 +693,18 @@ function propagateDeltaToTrack(obj, patch, before) {
  */
 export function removeObject(id, options = {}) {
   const frame = currentFrame.value
-  if (!frame) return
+  if (!frame || currentFrameLocked()) return
   const obj = frame.objects.find((o) => o.id === id)
   if (!obj) return
   const propagate = options.propagate ?? !!obj.multiFrame
   if (propagate && obj.trackId > 0) {
     for (let j = state.currentIndex; j < state.frames.length; j++) {
       const objects = state.frames[j].objects
+      if (!objects.some((o) => o.trackId === obj.trackId)) continue
+      if (j !== state.currentIndex && isFrameLocked(j)) {
+        noteLockedSkip()
+        continue
+      }
       for (let k = objects.length - 1; k >= 0; k--) {
         if (objects[k].trackId === obj.trackId) objects.splice(k, 1)
       }
@@ -681,7 +732,7 @@ export function countTrackFrames(trackId) {
  */
 export function syncTrackForward(id) {
   const obj = currentObjects.value.find((o) => o.id === id)
-  if (!obj || !obj.trackId) return 0
+  if (!obj || !obj.trackId || currentFrameLocked()) return 0
   const props = isMarking(obj)
     ? {
         classId: obj.classId,
@@ -704,8 +755,13 @@ export function syncTrackForward(id) {
       }
   let count = 0
   for (let j = state.currentIndex + 1; j < state.frames.length; j++) {
-    for (const o of state.frames[j].objects) {
-      if (o.trackId !== obj.trackId) continue
+    const targets = state.frames[j].objects.filter((o) => o.trackId === obj.trackId)
+    if (!targets.length) continue
+    if (isFrameLocked(j)) {
+      noteLockedSkip()
+      continue
+    }
+    for (const o of targets) {
       Object.assign(o, props)
       if (isMarking(o)) {
         // 深拷贝，避免后续帧共享同一顶点数组
@@ -720,6 +776,7 @@ export function syncTrackForward(id) {
 
 /** 清空当前帧的全部标注 */
 export function clearObjects() {
+  if (currentFrameLocked()) return
   const frame = currentFrame.value
   if (frame) frame.objects.splice(0, frame.objects.length)
   state.selectedObjectIds = []
@@ -796,7 +853,7 @@ function resolvePastedClassId(obj) {
  */
 export function pasteObjects({ inPlace = false } = {}) {
   const frame = currentFrame.value
-  if (!frame || !clipboard.length) return 0
+  if (!frame || !clipboard.length || currentFrameLocked()) return 0
   const offset = inPlace ? 0 : ++pasteSerial
   const created = []
   for (const src of clipboard) {
@@ -846,7 +903,7 @@ export function duplicateSelected() {
  * @param {{dx?:number,dy?:number,dz?:number}} delta
  */
 export function translateObjects(ids, { dx = 0, dy = 0, dz = 0 } = {}) {
-  if (!dx && !dy && !dz) return 0
+  if ((!dx && !dy && !dz) || currentFrameLocked()) return 0
   const wanted = new Set(ids || [])
   const objects = currentObjects.value.filter((o) => wanted.has(o.id))
   for (const obj of objects) {
@@ -957,9 +1014,11 @@ export function applyProject(data, { merge = true } = {}) {
   }
   const byName = new Map(data.frames.map((f) => [f.name, f]))
   const positional = data.frames.length === state.frames.length
+  const matchedIndexes = []
   state.frames.forEach((frame, i) => {
     const incoming = byName.get(frame.name) || (positional ? data.frames[i] : null)
     if (!incoming || !Array.isArray(incoming.objects)) return
+    matchedIndexes.push(i)
     const objects = incoming.objects.map((o) => {
       const classId = o.classId ?? ensureClass(o.type || 'Object')
       if (o.shape === 'line' || o.shape === 'arrow') {
@@ -1010,6 +1069,7 @@ export function applyProject(data, { merge = true } = {}) {
   trackSeq = Math.max(trackSeq, maxTrack)
   state.selectedObjectIds = []
   state.selectedObjectId = null
+  return matchedIndexes
 }
 
 /**
@@ -1039,7 +1099,7 @@ export function countNonKittiObjects() {
 /** 从 KITTI 文本导入到当前帧 */
 export function importKittiText(text, { merge = true } = {}) {
   const frame = currentFrame.value
-  if (!frame) return 0
+  if (!frame || currentFrameLocked()) return 0
   const objects = kittiTextToObjects(text, (name) => ensureClass(name)).map((o) => ({
     ...o,
     id: uid('obj'),

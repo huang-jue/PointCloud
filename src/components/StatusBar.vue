@@ -5,6 +5,7 @@
  */
 import { computed } from 'vue'
 import { state, currentFrame, currentObjects } from '../stores/useAnnotationStore.js'
+import { reviewSummary, statusLabel, statusType } from '../stores/useReviewStore.js'
 
 /** 所有帧点数之和（部分帧未加载则只统计已加载的） */
 const totalPoints = computed(() => {
@@ -29,6 +30,11 @@ const coordText = computed(
 <template>
   <div class="statusbar">
     <el-tag size="small" effect="dark" type="info">{{ state.datasetName || '未加载' }}</el-tag>
+    <el-tag v-if="currentFrame" size="small" :type="statusType" effect="plain">{{ statusLabel }}</el-tag>
+    <span v-if="reviewSummary.total" class="mono">
+      审核 通过 {{ reviewSummary.approved }} · 待审 {{ reviewSummary.submitted }} · 打回
+      {{ reviewSummary.rejected }}
+    </span>
     <span v-if="state.gtLoading" class="mono">正在加载全量真值…</span>
     <span v-if="currentFrame" class="mono">
       帧 {{ state.currentIndex + 1 }}/{{ state.frames.length }} · 点数

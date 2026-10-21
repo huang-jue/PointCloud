@@ -29,6 +29,7 @@
  * }
  */
 import { state } from '../stores/useAnnotationStore.js'
+import { serializeReview } from '../stores/useReviewStore.js'
 import { viewerRef } from '../three/viewerRef.js'
 import { post } from './http.js'
 
@@ -69,6 +70,7 @@ export function buildSavePayload({ includeLabels = true } = {}) {
     savedAt: new Date().toISOString(),
     coordinate: { ...state.coordinate },
     classes: state.classes.map((c) => ({ ...c })),
+    review: serializeReview(),
     frames,
   }
 }
@@ -93,7 +95,22 @@ export function summarizePayload(payload) {
       labeledPoints += f.pointLabels.labeled
     }
   }
-  return { frames: payload.frames.length, objects, boxes, lines, arrows, labeledFrames, labeledPoints }
+  const comments = payload.review?.comments?.length || 0
+  const review = { submitted: 0, approved: 0, rejected: 0 }
+  for (const workflow of Object.values(payload.review?.workflows || {})) {
+    if (review[workflow.status] !== undefined) review[workflow.status]++
+  }
+  return {
+    frames: payload.frames.length,
+    objects,
+    boxes,
+    lines,
+    arrows,
+    labeledFrames,
+    labeledPoints,
+    comments,
+    review,
+  }
 }
 
 /**
