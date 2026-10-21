@@ -46,6 +46,9 @@ const coordText = computed(
     <span v-if="state.tool === 'line' || state.tool === 'arrow'" class="mono">
       绘制中 · 已落点 {{ state.draftCount }}
     </span>
+    <span v-if="state.measureEnabled" class="mono measure-status">
+      测量中 · {{ state.measureText || '依次点击两个点' }}
+    </span>
     <el-tooltip :content="`坐标约定 ${coordText}`" placement="top">
       <span style="cursor: help">坐标 Z↑</span>
     </el-tooltip>

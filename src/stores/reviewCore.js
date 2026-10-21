@@ -25,6 +25,31 @@ export const STATUS_META = {
 
 const STATUS_VALUES = new Set(Object.keys(STATUS_META))
 
+export const COMMENT_STATUS = {
+  PENDING: 'pending',
+  IN_PROGRESS: 'in_progress',
+  DONE: 'done',
+}
+
+export const COMMENT_STATUS_META = {
+  pending: { label: '待处理', type: 'warning' },
+  in_progress: { label: '处理中', type: 'primary' },
+  done: { label: '已完成', type: 'success' },
+}
+
+const COMMENT_STATUS_VALUES = new Set(Object.keys(COMMENT_STATUS_META))
+
+export const REJECT_CATEGORIES = [
+  { id: 'missing', label: '漏标' },
+  { id: 'box', label: '框不准' },
+  { id: 'class', label: '类别错' },
+  { id: 'size', label: '尺寸错' },
+  { id: 'label', label: '点标签错' },
+  { id: 'other', label: '其他' },
+]
+
+const REJECT_CATEGORY_VALUES = new Set(REJECT_CATEGORIES.map((c) => c.id))
+
 export const reviewState = reactive({
   dataset: '',
   schemaVersion: REVIEW_SCHEMA_VERSION,
@@ -146,9 +171,28 @@ export function cloneWorkflow(wf) {
   }
 }
 
+function normalizeReply(value) {
+  if (!value || typeof value !== 'object' || typeof value.text !== 'string') return null
+  return {
+    id: value.id || `rep_${value.createdAt || Date.now()}`,
+    author: String(value.author || ''),
+    role: String(value.role || ''),
+    text: value.text,
+    createdAt: Number.isFinite(value.createdAt) ? value.createdAt : Date.now(),
+  }
+}
+
 export function normalizeComment(value) {
   if (!value || typeof value !== 'object') return null
   if (typeof value.text !== 'string' || !Number.isFinite(value.frameIndex)) return null
+
+  const status = COMMENT_STATUS_VALUES.has(value.status)
+    ? value.status
+    : value.resolved
+      ? COMMENT_STATUS.DONE
+      : COMMENT_STATUS.PENDING
+  const category = REJECT_CATEGORY_VALUES.has(value.category) ? value.category : null
+
   return {
     ...value,
     id: value.id || `cmt_${value.frameIndex}_${value.createdAt || Date.now()}`,
@@ -165,7 +209,12 @@ export function normalizeComment(value) {
         ? value.createdAt
         : Date.now(),
     round: Number.isFinite(value.round) ? value.round : 0,
-    resolved: !!value.resolved,
+    status,
+    category,
+    replies: Array.isArray(value.replies)
+      ? value.replies.map(normalizeReply).filter(Boolean)
+      : [],
+    resolved: status === COMMENT_STATUS.DONE,
     resolvedBy: value.resolvedBy ? String(value.resolvedBy) : null,
     resolvedAt: Number.isFinite(value.resolvedAt) ? value.resolvedAt : null,
   }
@@ -196,4 +245,16 @@ export function statusLabelOf(status) {
 
 export function statusTypeOf(status) {
   return STATUS_META[status]?.type || STATUS_META.draft.type
+}
+
+export function commentStatusLabel(status) {
+  return COMMENT_STATUS_META[status]?.label || COMMENT_STATUS_META.pending.label
+}
+
+export function commentStatusType(status) {
+  return COMMENT_STATUS_META[status]?.type || COMMENT_STATUS_META.pending.type
+}
+
+export function rejectCategoryLabel(id) {
+  return REJECT_CATEGORIES.find((c) => c.id === id)?.label || '未分类'
 }

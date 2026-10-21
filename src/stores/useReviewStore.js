@@ -25,7 +25,10 @@ import { state, selectedObjects } from './useAnnotationStore.js'
 import { canAnnotate, canComment, canReview, currentRole, currentUser } from './useAuthStore.js'
 import { uid } from '../utils/id.js'
 import { diffSnapshots, snapshotFrame } from '../utils/diff.js'
+import { saveVersion } from '../utils/versionDb.js'
 import {
+  COMMENT_STATUS,
+  REJECT_CATEGORIES,
   REVIEW_SCHEMA_VERSION,
   STATUS,
   cloneWorkflow,
@@ -40,7 +43,16 @@ import {
   statusTypeOf,
 } from './reviewCore.js'
 
-export { reviewState, frameStatus, frameWorkflow, isFrameLocked, statusLabelOf, statusTypeOf }
+export {
+  COMMENT_STATUS,
+  REJECT_CATEGORIES,
+  reviewState,
+  frameStatus,
+  frameWorkflow,
+  isFrameLocked,
+  statusLabelOf,
+  statusTypeOf,
+}
 
 const STORAGE_PREFIX = 'pc-annotate-review:'
 const EMPTY_WORKFLOW = Object.freeze(defaultWorkflow())
@@ -73,6 +85,21 @@ function workflowForWrite(frameIndex) {
 
 function frameAt(frameIndex) {
   return state.frames[frameIndex] || null
+}
+
+function rememberFrameVersion(frameIndex, kind) {
+  const frame = frameAt(frameIndex)
+  if (!frame) return
+  saveVersion({
+    dataset: reviewState.dataset || state.datasetName || 'local',
+    frameIndex,
+    round: frameWorkflow(frameIndex)?.round || 0,
+    kind,
+    actor: currentUser.value?.name || '',
+    objects: frame.objects,
+  }).catch(() => {
+    /* IndexedDB 不可用时忽略 */
+  })
 }
 
 function pushHistory(workflow, type, at, extra = {}) {
@@ -381,7 +408,9 @@ export function commentCountForFrame(frameIndex) {
 }
 
 export function unresolvedCommentCountForFrame(frameIndex) {
-  return reviewState.comments.filter((c) => c.frameIndex === frameIndex && !c.resolved).length
+  return reviewState.comments.filter(
+    (c) => c.frameIndex === frameIndex && c.status !== COMMENT_STATUS.DONE && !c.resolved,
+  ).length
 }
 
 /* ---------------- 批注 ---------------- */
@@ -420,6 +449,9 @@ export function addComment(text) {
     createdAt: now,
     updatedAt: now,
     round: workflow?.round || 0,
+    status: COMMENT_STATUS.PENDING,
+    category: null,
+    replies: [],
     resolved: false,
     resolvedBy: null,
     resolvedAt: null,
@@ -429,20 +461,98 @@ export function addComment(text) {
   return comment
 }
 
-/** 标记批注已解决 / 取消解决 */
-export function resolveComment(id, resolved = true) {
+function canManageComment(comment, user) {
+  if (!comment || !user) return false
+  return canComment.value || comment.author === user.name
+}
+
+/** 修改批注处理状态 */
+export function updateCommentStatus(id, status) {
   const comment = reviewState.comments.find((c) => c.id === id)
   if (!comment) return null
   const user = currentUser.value
   if (!user) throw new Error('请先登录')
-  if (!canComment.value && comment.author !== user.name) {
-    throw new Error('只有批注作者或批注员可以标记解决')
-  }
+  if (!canManageComment(comment, user)) throw new Error('没有权限修改该批注')
+  if (!Object.values(COMMENT_STATUS).includes(status)) throw new Error('无效的批注状态')
   const now = nowStamp(comment.updatedAt || comment.createdAt)
-  comment.resolved = !!resolved
-  comment.resolvedBy = resolved ? user.name : null
-  comment.resolvedAt = resolved ? now : null
+  comment.status = status
+  comment.resolved = status === COMMENT_STATUS.DONE
+  comment.resolvedBy = comment.resolved ? user.name : null
+  comment.resolvedAt = comment.resolved ? now : null
   comment.updatedAt = now
+  saveReview()
+  return comment
+}
+
+/** 标记批注已解决 / 取消解决（兼容旧接口） */
+export function resolveComment(id, resolved = true) {
+  return updateCommentStatus(id, resolved ? COMMENT_STATUS.DONE : COMMENT_STATUS.PENDING)
+}
+
+/** 回复批注（所有登录角色都可以参与讨论） */
+export function addCommentReply(id, text) {
+  const comment = reviewState.comments.find((c) => c.id === id)
+  if (!comment) throw new Error('批注不存在')
+  const user = currentUser.value
+  if (!user) throw new Error('请先登录后回复')
+  const content = String(text || '').trim().slice(0, 1000)
+  if (!content) throw new Error('回复内容不能为空')
+  if (!Array.isArray(comment.replies)) comment.replies = []
+  const now = nowStamp(comment.updatedAt || comment.createdAt)
+  comment.replies.push({
+    id: uid('rep'),
+    author: user.name,
+    role: user.role,
+    text: content,
+    createdAt: now,
+  })
+  comment.updatedAt = now
+  saveReview()
+  return comment
+}
+
+/** 编辑批注正文（作者或管理员） */
+export function updateCommentText(id, text) {
+  const comment = reviewState.comments.find((c) => c.id === id)
+  if (!comment) throw new Error('批注不存在')
+  const user = currentUser.value
+  if (!user) throw new Error('请先登录')
+  if (comment.author !== user.name && currentRole.value !== 'admin') {
+    throw new Error('只有批注作者或管理员可以编辑')
+  }
+  const content = String(text || '').trim().slice(0, 2000)
+  if (!content) throw new Error('批注内容不能为空')
+  comment.text = content
+  comment.updatedAt = nowStamp(comment.updatedAt || comment.createdAt)
+  saveReview()
+  return comment
+}
+
+/** 删除批注（作者或管理员） */
+export function deleteComment(id) {
+  const user = currentUser.value
+  if (!user) throw new Error('请先登录')
+  const index = reviewState.comments.findIndex((c) => c.id === id)
+  if (index === -1) return false
+  const comment = reviewState.comments[index]
+  if (comment.author !== user.name && currentRole.value !== 'admin') {
+    throw new Error('只有批注作者或管理员可以删除')
+  }
+  reviewState.comments.splice(index, 1)
+  saveReview()
+  return true
+}
+
+/** 设置打回分类 */
+export function setCommentCategory(id, category) {
+  const comment = reviewState.comments.find((c) => c.id === id)
+  if (!comment) return null
+  if (!canComment.value) throw new Error('当前角色不能修改分类')
+  if (category && !REJECT_CATEGORIES.some((c) => c.id === category)) {
+    throw new Error('无效的打回分类')
+  }
+  comment.category = category || null
+  comment.updatedAt = nowStamp(comment.updatedAt || comment.createdAt)
   saveReview()
   return comment
 }
@@ -477,6 +587,7 @@ function commitSubmit(frameIndex) {
   workflow.lastDiff = lastDiff
   workflow.updatedAt = now
   pushHistory(workflow, 'submitted', now)
+  rememberFrameVersion(frameIndex, 'submit')
   return workflow
 }
 
@@ -564,6 +675,7 @@ function commitApprove(frameIndex, note = '') {
   workflow.reason = null
   workflow.updatedAt = now
   pushHistory(workflow, 'approved', now, note ? { reason: String(note) } : {})
+  rememberFrameVersion(frameIndex, 'approve')
   return workflow
 }
 
@@ -596,12 +708,13 @@ export function approveAllFrames() {
 }
 
 /** 批注员/管理员打回当前帧 */
-export function rejectFrame(reason, frameIndex = state.currentIndex) {
+export function rejectFrame(reason, frameIndex = state.currentIndex, category = 'other') {
   if (!canReview.value || !currentUser.value) throw new Error('当前角色不能打回')
   if (state.gtLoading) throw new Error('全量真值正在导入，请稍后再审核')
   const workflow = workflowForWrite(frameIndex)
   if (workflow.status !== STATUS.SUBMITTED) throw new Error('只有待审核的帧可以打回')
   const text = String(reason || '').trim() || '请根据批注修改后重新提交'
+  const safeCategory = REJECT_CATEGORIES.some((c) => c.id === category) ? category : 'other'
   const now = nowStamp(workflow.updatedAt)
   const target = currentCommentTarget()
   const frame = frameAt(frameIndex)
@@ -626,6 +739,9 @@ export function rejectFrame(reason, frameIndex = state.currentIndex) {
       createdAt: now,
       updatedAt: now,
       round: workflow.round,
+      status: COMMENT_STATUS.PENDING,
+      category: safeCategory,
+      replies: [],
       resolved: false,
       resolvedBy: null,
       resolvedAt: null,

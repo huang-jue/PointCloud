@@ -8,6 +8,7 @@
     "build": "vite build",
     "preview": "vite preview",
     "gen:test-data": "node scripts/gen-test-data.mjs",
+    "gen:images": "node scripts/gen-images.mjs",
     "fetch:test-data": "node scripts/fetch-test-data.mjs"
   },
   "dependencies": {

@@ -33,6 +33,7 @@ import {
 } from '../stores/useReviewStore.js'
 import { withLoading } from '../utils/http.js'
 import { authState, currentRole, openLogin, logout, roleLabel } from '../stores/useAuthStore.js'
+import { uiState } from '../stores/useUiStore.js'
 
 const fileInput = ref(null)
 const datasets = ref([]) // 示例数据集列表（来自 index.json）
@@ -167,6 +168,18 @@ function onMoreCommand(command) {
     case 'reset-review':
       resetAllReview()
       break
+    case 'workbench':
+      uiState.workbenchOpen = true
+      break
+    case 'tour':
+      uiState.tourOpen = true
+      break
+    case 'quality':
+      uiState.qualityOpen = true
+      break
+    case 'versions':
+      uiState.versionsOpen = true
+      break
     default:
       break
   }
@@ -216,6 +229,10 @@ function addBox() {
 
 function deleteSelected() {
   requestRemoveObjects(selectedObjects.value)
+}
+
+function toggleMeasure() {
+  state.measureEnabled = !state.measureEnabled
 }
 
 function copySelection() {
@@ -398,6 +415,20 @@ async function resetAllReview() {
         <span>添加框</span>
       </el-button>
 
+      <el-button :disabled="!state.frames.length || !canEditCurrentFrame" @click="uiState.suggestionsOpen = true">
+        <el-icon><MagicStick /></el-icon>
+        <span>AI 建议</span>
+      </el-button>
+
+      <el-button
+        :type="state.measureEnabled ? 'primary' : ''"
+        :plain="state.measureEnabled"
+        :disabled="!state.frames.length"
+        @click="toggleMeasure"
+      >
+        测量
+      </el-button>
+
       <el-button-group class="selection-actions">
         <el-button
           :disabled="!selectedObjects.length"
@@ -499,6 +530,11 @@ async function resetAllReview() {
               :show-tooltip="false"
             />
           </div>
+          <div class="popover-field">
+            <el-button size="small" style="width: 100%" @click="uiState.imageOpen = true">
+              2D 图像联动
+            </el-button>
+          </div>
         </div>
       </el-popover>
 
@@ -526,9 +562,14 @@ async function resetAllReview() {
             <el-dropdown-item command="export-project" :disabled="!state.frames.length">
               导出标注（项目 JSON）
             </el-dropdown-item>
+            <el-dropdown-item divided command="workbench" :disabled="!state.frames.length">
+              审核工作台
+            </el-dropdown-item>
+            <el-dropdown-item command="quality">质量检查</el-dropdown-item>
+            <el-dropdown-item command="versions" :disabled="!state.frames.length">版本快照</el-dropdown-item>
+            <el-dropdown-item command="tour">演示引导</el-dropdown-item>
             <el-dropdown-item
               v-if="currentRole === 'admin'"
-              divided
               command="reset-review"
               :disabled="!state.frames.length"
             >

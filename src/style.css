@@ -191,6 +191,17 @@ body {
   word-break: break-word;
 }
 
+.pc-measure-label {
+  padding: 2px 7px;
+  border-radius: 10px;
+  background: rgba(13, 17, 23, 0.9);
+  border: 1px solid rgba(255, 209, 102, 0.8);
+  color: #ffd166;
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
 .viewport canvas {
   display: block;
   width: 100%;
@@ -619,6 +630,10 @@ body {
 
 .hidden-input {
   display: none;
+}
+
+.measure-status {
+  color: #ffd166;
 }
 
 .props-locked {

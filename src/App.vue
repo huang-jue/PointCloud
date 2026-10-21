@@ -13,6 +13,12 @@ import Properties from './components/Properties.vue'
 import ClassManager from './components/ClassManager.vue'
 import SegmentPanel from './components/SegmentPanel.vue'
 import CommentPanel from './components/CommentPanel.vue'
+import ReviewWorkbench from './components/ReviewWorkbench.vue'
+import SuggestionPanel from './components/SuggestionPanel.vue'
+import QualityPanel from './components/QualityPanel.vue'
+import VersionPanel from './components/VersionPanel.vue'
+import ImagePanel from './components/ImagePanel.vue'
+import DemoTour from './components/DemoTour.vue'
 import LoginDialog from './components/LoginDialog.vue'
 import Viewer from './components/Viewer.vue'
 import Timeline from './components/Timeline.vue'
@@ -267,6 +273,12 @@ onBeforeUnmount(() => {
     </div>
     <Timeline />
     <StatusBar />
+    <ReviewWorkbench />
+    <SuggestionPanel />
+    <QualityPanel />
+    <VersionPanel />
+    <ImagePanel />
+    <DemoTour />
     <LoginDialog />
   </div>
 </template>

@@ -18,7 +18,15 @@ import {
   roleTagType,
 } from '../stores/useAuthStore.js'
 import {
+  COMMENT_STATUS,
+  COMMENT_STATUS_META,
+  REJECT_CATEGORIES,
+  rejectCategoryLabel,
+} from '../stores/reviewCore.js'
+import { openUi } from '../stores/useUiStore.js'
+import {
   addComment,
+  addCommentReply,
   approveAllFrames,
   approveFrame,
   batchSubmitSummary,
@@ -33,23 +41,32 @@ import {
   currentFrameComments,
   currentFrameStatus,
   currentWorkflow,
+  deleteComment,
   diffForFrame,
   isFrameLocked,
   loadReview,
   rejectFrame,
   reopenFrame,
-  resolveComment,
   reviewSummary,
+  setCommentCategory,
   statusLabel,
   statusType,
   submitAllFrames,
   submitFrame,
   submittedIndexes,
+  updateCommentStatus,
+  updateCommentText,
   withdrawAllFrames,
   withdrawFrame,
 } from '../stores/useReviewStore.js'
 
 const commentText = ref('')
+const commentFilter = ref('all')
+const replyingId = ref(null)
+const replyText = ref('')
+const rejectOpen = ref(false)
+const rejectReason = ref('')
+const rejectCategory = ref('other')
 
 const HISTORY_META = {
   submitted: { label: '提交审核', type: 'warning' },
@@ -81,18 +98,33 @@ const lockText = computed(() => {
 
 const summary = computed(() => reviewSummary.value)
 const currentUserName = computed(() => currentUser.value?.name || '')
-const unresolvedCount = computed(() => currentFrameComments.value.filter((c) => !c.resolved).length)
-
-const sortedComments = computed(() =>
-  currentFrameComments.value
-    .slice()
-    .sort((a, b) => Number(a.resolved) - Number(b.resolved) || a.createdAt - b.createdAt),
+const unresolvedCount = computed(
+  () => currentFrameComments.value.filter((c) => c.status !== COMMENT_STATUS.DONE).length,
 )
+
+const sortedComments = computed(() => {
+  const filtered =
+    commentFilter.value === 'all'
+      ? currentFrameComments.value
+      : currentFrameComments.value.filter((c) => c.status === commentFilter.value)
+  return filtered
+    .slice()
+    .sort(
+      (a, b) =>
+        Number(a.status === COMMENT_STATUS.DONE) - Number(b.status === COMMENT_STATUS.DONE) ||
+        a.createdAt - b.createdAt,
+    )
+})
 
 const historyEntries = computed(() => (currentWorkflow.value.history || []).slice().reverse())
 
-const canResolve = (comment) =>
+const canManageComment = (comment) =>
   canComment.value || (comment.author && comment.author === currentUserName.value)
+
+const canDeleteComment = (comment) =>
+  comment.author === currentUserName.value || currentRole.value === 'admin'
+
+const commentStatusMeta = (status) => COMMENT_STATUS_META[status] || COMMENT_STATUS_META.pending
 
 const diffTitle = computed(() => {
   const workflow = currentWorkflow.value
@@ -146,6 +178,8 @@ watch(
   () => state.currentIndex,
   () => {
     commentText.value = ''
+    replyingId.value = null
+    replyText.value = ''
   },
 )
 
@@ -156,6 +190,75 @@ function formatTime(ts) {
 
 function historyMeta(type) {
   return HISTORY_META[type] || { label: type, type: 'info' }
+}
+
+function changeCommentStatus(comment, status) {
+  try {
+    updateCommentStatus(comment.id, status)
+  } catch (err) {
+    ElMessage.warning(err.message || String(err))
+  }
+}
+
+function startReply(comment) {
+  replyingId.value = replyingId.value === comment.id ? null : comment.id
+  replyText.value = ''
+}
+
+function submitReply(comment) {
+  try {
+    addCommentReply(comment.id, replyText.value)
+    replyText.value = ''
+    replyingId.value = null
+  } catch (err) {
+    ElMessage.warning(err.message || String(err))
+  }
+}
+
+async function startEdit(comment) {
+  try {
+    const { value } = await ElMessageBox.prompt('修改批注内容', '编辑批注', {
+      inputType: 'textarea',
+      inputValue: comment.text,
+      inputValidator: (v) => (String(v || '').trim() ? true : '批注内容不能为空'),
+      confirmButtonText: '保存',
+      cancelButtonText: '取消',
+    })
+    updateCommentText(comment.id, value)
+    ElMessage.success('批注已更新')
+  } catch {
+    /* 取消 */
+  }
+}
+
+async function removeComment(comment) {
+  try {
+    await ElMessageBox.confirm('确定删除这条批注及其回复？', '删除批注', {
+      type: 'warning',
+      confirmButtonText: '删除',
+      cancelButtonText: '取消',
+    })
+  } catch {
+    return
+  }
+  try {
+    deleteComment(comment.id)
+    ElMessage.success('批注已删除')
+  } catch (err) {
+    ElMessage.warning(err.message || String(err))
+  }
+}
+
+function changeCategory(comment, category) {
+  try {
+    setCommentCategory(comment.id, category)
+  } catch (err) {
+    ElMessage.warning(err.message || String(err))
+  }
+}
+
+function openWorkbench() {
+  openUi('workbenchOpen')
 }
 
 async function submitComment() {
@@ -297,27 +400,20 @@ async function approveCurrent() {
   }
 }
 
-async function rejectCurrent() {
-  let value = ''
-  try {
-    const result = await ElMessageBox.prompt(
-      '请填写打回原因，会同时生成一条批注记录。',
-      '打回提交',
-      {
-        inputType: 'textarea',
-        inputPlaceholder: '例如：第 3 帧车辆框未贴地，请修改后重新提交',
-        inputValidator: (v) => (String(v || '').trim() ? true : '请输入打回原因'),
-        confirmButtonText: '打回',
-        cancelButtonText: '取消',
-        type: 'warning',
-      },
-    )
-    value = result.value
-  } catch {
+function openRejectDialog() {
+  rejectReason.value = ''
+  rejectCategory.value = 'other'
+  rejectOpen.value = true
+}
+
+function confirmReject() {
+  if (!rejectReason.value.trim()) {
+    ElMessage.warning('请输入打回原因')
     return
   }
   try {
-    rejectFrame(value)
+    rejectFrame(rejectReason.value, state.currentIndex, rejectCategory.value)
+    rejectOpen.value = false
     ElMessage.success('已打回，标注员可继续修改')
   } catch (err) {
     ElMessage.warning(err.message || String(err))
@@ -341,14 +437,6 @@ async function reopenCurrent() {
   try {
     reopenFrame(state.currentIndex, value)
     ElMessage.success('已重新打开')
-  } catch (err) {
-    ElMessage.warning(err.message || String(err))
-  }
-}
-
-async function toggleResolve(comment) {
-  try {
-    resolveComment(comment.id, !comment.resolved)
   } catch (err) {
     ElMessage.warning(err.message || String(err))
   }
@@ -389,9 +477,12 @@ function locateDiffItem(item) {
   <div class="section">
     <h3 class="section-title">
       <span>批注与审核</span>
-      <el-tag v-if="currentUser" size="small" :type="roleTagType(currentUser.role)" effect="plain">
-        {{ roleLabel(currentUser.role) }}
-      </el-tag>
+      <span class="row" style="gap: 4px">
+        <el-tag v-if="currentUser" size="small" :type="roleTagType(currentUser.role)" effect="plain">
+          {{ roleLabel(currentUser.role) }}
+        </el-tag>
+        <el-button link size="small" @click="openWorkbench">工作台</el-button>
+      </span>
     </h3>
 
     <div class="review-summary">
@@ -465,17 +556,33 @@ function locateDiffItem(item) {
       <span class="hint">本帧批注</span>
       <span class="comment-count">{{ currentFrameComments.length }}</span>
       <span v-if="unresolvedCount" class="hint unresolved-hint">未解决 {{ unresolvedCount }}</span>
+      <span class="spacer" style="flex: 1"></span>
+      <el-select v-model="commentFilter" size="small" style="width: 92px">
+        <el-option label="全部状态" value="all" />
+        <el-option label="待处理" value="pending" />
+        <el-option label="处理中" value="in_progress" />
+        <el-option label="已完成" value="done" />
+      </el-select>
     </div>
 
-    <div v-if="!currentFrameComments.length" class="hint comment-empty">
-      {{ currentFrame ? '本帧暂无批注' : '请先加载数据' }}
+    <div v-if="!sortedComments.length" class="hint comment-empty">
+      {{
+        currentFrame
+          ? currentFrameComments.length
+            ? '没有符合筛选条件的批注'
+            : '本帧暂无批注'
+          : '请先加载数据'
+      }}
     </div>
     <div v-else class="comment-list">
       <div
         v-for="c in sortedComments"
         :key="c.id"
         class="comment-item"
-        :class="{ rejection: c.kind === 'rejection', resolved: c.resolved }"
+        :class="{
+          rejection: c.kind === 'rejection',
+          resolved: c.status === 'done',
+        }"
       >
         <div class="comment-meta">
           <span class="comment-author">{{ c.author }}</span>
@@ -485,14 +592,80 @@ function locateDiffItem(item) {
           <el-tag v-if="c.objectLabel" size="small" type="info" effect="plain">
             {{ c.objectLabel }}
           </el-tag>
-          <el-tag v-if="c.resolved" size="small" type="success" effect="plain">已解决</el-tag>
+          <el-tag
+            size="small"
+            :type="commentStatusMeta(c.status).type"
+            effect="plain"
+          >
+            {{ commentStatusMeta(c.status).label }}
+          </el-tag>
+          <el-tag v-if="c.category" size="small" type="warning" effect="plain">
+            {{ rejectCategoryLabel(c.category) }}
+          </el-tag>
           <span class="hint">{{ formatTime(c.createdAt) }}</span>
         </div>
         <div class="comment-text">{{ c.text }}</div>
+
+        <div v-if="c.replies?.length" class="comment-replies">
+          <div v-for="reply in c.replies" :key="reply.id" class="comment-reply">
+            <span class="reply-author">{{ reply.author }}</span>
+            <span class="hint">{{ formatTime(reply.createdAt) }}</span>
+            <div class="reply-text">{{ reply.text }}</div>
+          </div>
+        </div>
+
+        <div v-if="replyingId === c.id" class="reply-editor">
+          <el-input
+            v-model="replyText"
+            type="textarea"
+            :rows="2"
+            maxlength="1000"
+            placeholder="回复这条批注…"
+            @keyup.ctrl.enter="submitReply(c)"
+          />
+          <div class="row" style="margin-top: 4px">
+            <el-button size="small" type="primary" plain :disabled="!replyText.trim()" @click="submitReply(c)">
+              发送回复
+            </el-button>
+            <el-button size="small" @click="replyingId = null">取消</el-button>
+          </div>
+        </div>
+
         <div class="comment-actions">
           <el-button link size="small" @click="locateComment(c)">定位</el-button>
-          <el-button v-if="canResolve(c)" link size="small" @click="toggleResolve(c)">
-            {{ c.resolved ? '取消解决' : '标记解决' }}
+          <el-button link size="small" @click="startReply(c)">
+            {{ replyingId === c.id ? '收起回复' : '回复' }}
+          </el-button>
+          <el-select
+            v-if="canManageComment(c)"
+            :model-value="c.status"
+            size="small"
+            style="width: 86px"
+            @change="(v) => changeCommentStatus(c, v)"
+          >
+            <el-option label="待处理" value="pending" />
+            <el-option label="处理中" value="in_progress" />
+            <el-option label="已完成" value="done" />
+          </el-select>
+          <el-select
+            v-if="canComment"
+            :model-value="c.category"
+            size="small"
+            clearable
+            placeholder="分类"
+            style="width: 86px"
+            @change="(v) => changeCategory(c, v)"
+          >
+            <el-option
+              v-for="cat in REJECT_CATEGORIES"
+              :key="cat.id"
+              :label="cat.label"
+              :value="cat.id"
+            />
+          </el-select>
+          <el-button v-if="canDeleteComment(c)" link size="small" @click="startEdit(c)">编辑</el-button>
+          <el-button v-if="canDeleteComment(c)" link type="danger" size="small" @click="removeComment(c)">
+            删除
           </el-button>
         </div>
       </div>
@@ -557,7 +730,7 @@ function locateDiffItem(item) {
         type="danger"
         plain
         :disabled="!canRejectCurrentFrame"
-        @click="rejectCurrent"
+        @click="openRejectDialog"
       >
         打回
       </el-button>
@@ -602,6 +775,30 @@ function locateDiffItem(item) {
         全部通过（{{ submittedIndexes.length }}）
       </el-button>
     </div>
+
+    <el-dialog v-model="rejectOpen" title="打回提交" width="420px" append-to-body>
+      <div class="field" style="margin-bottom: 10px">
+        <label>打回分类</label>
+        <el-select v-model="rejectCategory" style="width: 100%">
+          <el-option v-for="cat in REJECT_CATEGORIES" :key="cat.id" :label="cat.label" :value="cat.id" />
+        </el-select>
+      </div>
+      <div class="field">
+        <label>打回原因</label>
+        <el-input
+          v-model="rejectReason"
+          type="textarea"
+          :rows="3"
+          maxlength="500"
+          show-word-limit
+          placeholder="例如：第 3 帧车辆框未贴地，请修改后重新提交"
+        />
+      </div>
+      <template #footer>
+        <el-button @click="rejectOpen = false">取消</el-button>
+        <el-button type="danger" :disabled="!rejectReason.trim()" @click="confirmReject">打回</el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
@@ -885,10 +1082,41 @@ function locateDiffItem(item) {
   word-break: break-word;
 }
 
+.comment-replies {
+  margin-top: 6px;
+  padding-left: 8px;
+  border-left: 2px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.comment-reply {
+  font-size: 12px;
+}
+
+.reply-author {
+  color: var(--text);
+  font-weight: 600;
+  margin-right: 6px;
+}
+
+.reply-text {
+  color: var(--text-dim);
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.reply-editor {
+  margin-top: 6px;
+}
+
 .comment-actions {
   display: flex;
   align-items: center;
   gap: 4px;
+  flex-wrap: wrap;
   margin-top: 4px;
 }
 

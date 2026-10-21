@@ -36,6 +36,7 @@ import { pathExt } from '../utils/math.js'
 import { objectsToKittiText, kittiTextToObjects } from '../utils/kitti.js'
 import { get } from '../utils/http.js'
 import { isFrameLocked } from './reviewCore.js'
+import { defaultIntrinsics } from '../utils/projection.js'
 import {
   clonePoints,
   clonePaths,
@@ -128,6 +129,8 @@ export const state = reactive({
   brushSize: 24,
   selectionCount: 0,
   selectedSegment: null, // 当前选中的语义标签片段 { id, classId, count }
+  measureEnabled: false, // 测量模式
+  measureText: '', // 最近一次测量结果
   lastLabel: null, // 最近一次自动生成的标签 { classId, count }
   labelVersion: 0, // 标签数据版本号，用于触发面板刷新
 
@@ -217,6 +220,8 @@ export function reset() {
   state.selectedSegment = null
   state.lastLabel = null
   state.selectionCount = 0
+  state.measureEnabled = false
+  state.measureText = ''
   state.gtLoading = false
   state.loading = false
   state.loadingVisible = false
@@ -237,7 +242,9 @@ export function setScene(scene, baseUrl) {
   state.datasetName = scene.name || 'dataset'
   state.coordinate = scene.coordinate || state.coordinate
   state.sensorHeight = scene.sensor?.height ?? state.sensorHeight
-  state.camera = scene.camera || null
+  state.camera = scene.camera
+    ? { ...scene.camera, intrinsics: scene.camera.intrinsics || defaultIntrinsics() }
+    : null
   state.groundTruthUrl = scene.groundTruth ? joinUrl(baseUrl, scene.groundTruth) : null
   if (Array.isArray(scene.classes) && scene.classes.length) {
     state.classes = scene.classes.map((c) => ({ ...c }))
@@ -261,6 +268,7 @@ export function setScene(scene, baseUrl) {
       source: { kind: 'url', ext, url: joinUrl(baseUrl, file) },
       labelUrl: f.label ? joinUrl(baseUrl, f.label) : null,
       pointLabelsUrl: f.pointLabels ? joinUrl(baseUrl, f.pointLabels) : null,
+      imageUrl: f.image ? joinUrl(baseUrl, f.image) : null,
       pointCount: f.points ?? null,
       objects: [],
       loaded: false,
@@ -593,6 +601,7 @@ function propagateMarkingChange(obj, { points, paths }) {
  *  - 退出绘制 -> 恢复进入前的框类别
  */
 export function setTool(tool) {
+  if (tool !== 'select' && state.measureEnabled) state.measureEnabled = false
   const wasDraw = state.tool === 'line' || state.tool === 'arrow'
   const isDraw = tool === 'line' || tool === 'arrow'
   if (isDraw && !wasDraw) state.lastBoxClassId = state.activeClassId
@@ -772,6 +781,67 @@ export function syncTrackForward(id) {
     }
   }
   return count
+}
+
+/**
+ * 轨迹插值：在当前对象前后两个已存在帧之间补齐缺失帧。
+ * @param {string} id 当前帧对象 id
+ * @returns {{filled:number, skipped:number, from:number, to:number}}
+ */
+export function interpolateTrack(id) {
+  if (currentFrameLocked()) throw new Error('当前帧已提交/已通过，不能插值')
+  const obj = currentObjects.value.find((o) => o.id === id)
+  if (!obj) throw new Error('请先选中一个对象')
+  if (isMarking(obj)) throw new Error('轨迹插值目前只支持 3D 框')
+  if (!obj.trackId) throw new Error('该对象没有 trackId，无法插值')
+
+  let prev = null
+  let next = null
+  for (let index = 0; index < state.frames.length; index++) {
+    const found = state.frames[index].objects.find((o) => o.trackId === obj.trackId)
+    if (!found) continue
+    if (index < state.currentIndex) prev = { index, object: found }
+    else if (index > state.currentIndex && !next) next = { index, object: found }
+  }
+  const start = prev || { index: state.currentIndex, object: obj }
+  const end = next || { index: state.currentIndex, object: obj }
+  if (!prev && !next) throw new Error('该轨迹没有可插值的相邻帧')
+
+  let filled = 0
+  let skipped = 0
+  const span = end.index - start.index
+  for (let index = start.index + 1; index < end.index; index++) {
+    const frame = state.frames[index]
+    if (frame.objects.some((o) => o.trackId === obj.trackId)) continue
+    if (isFrameLocked(index)) {
+      skipped++
+      continue
+    }
+    const t = (index - start.index) / span
+    let ryDelta = (end.object.ry || 0) - (start.object.ry || 0)
+    while (ryDelta > Math.PI) ryDelta -= Math.PI * 2
+    while (ryDelta < -Math.PI) ryDelta += Math.PI * 2
+    frame.objects.push({
+      id: uid('obj'),
+      trackId: obj.trackId,
+      startFrame: start.index,
+      multiFrame: true,
+      classId: start.object.classId,
+      type: start.object.type,
+      h: start.object.h,
+      w: start.object.w,
+      l: start.object.l,
+      x: start.object.x + (end.object.x - start.object.x) * t,
+      y: start.object.y + (end.object.y - start.object.y) * t,
+      z: start.object.z + (end.object.z - start.object.z) * t,
+      ry: (start.object.ry || 0) + ryDelta * t,
+      score: 1,
+      source: 'interp',
+    })
+    filled++
+  }
+  if (skipped) state.lockSkipCount += skipped
+  return { filled, skipped, from: start.index, to: end.index }
 }
 
 /** 清空当前帧的全部标注 */
@@ -1148,6 +1218,7 @@ export const store = {
   updateObject,
   removeObject,
   syncTrackForward,
+  interpolateTrack,
   countTrackFrames,
   clearObjects,
   selectObject,

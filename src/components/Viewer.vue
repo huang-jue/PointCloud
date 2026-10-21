@@ -303,9 +303,19 @@ onMounted(() => {
     onVertexDelete: (objId, index, pathIndex) => {
       deletePolylinePoint(objId, index, pathIndex)
     },
+    onMeasure: (info) => {
+      if (!info) {
+        state.measureText = ''
+      } else if (info.pending) {
+        state.measureText = '已选第一个点，请点击第二个点'
+      } else {
+        state.measureText = `距离 ${info.distance.toFixed(2)}m · 水平 ${info.horizontal.toFixed(2)}m · 高差 ${info.height.toFixed(2)}m`
+      }
+    },
   })
   viewerRef.current = viewer
   viewer.setReadOnly(!canEditCurrentFrame.value)
+  viewer.setMeasureEnabled(state.measureEnabled)
   viewer.setSnapEnabled(state.snapToPoints)
   if (perfEnabled) {
     perfTimer = setInterval(() => {
@@ -376,9 +386,20 @@ watch(
   () => applyDrawOptions(),
 )
 watch(() => state.segEnabled, (on) => {
-  // 分割与标线绘制互斥：开启分割时退出绘制
-  if (on && (state.tool === 'line' || state.tool === 'arrow')) setTool('select')
+  // 分割与标线绘制/测量互斥：开启分割时退出绘制
+  if (on) {
+    if (state.tool === 'line' || state.tool === 'arrow') setTool('select')
+    if (state.measureEnabled) state.measureEnabled = false
+  }
   viewer?.setSegEnabled(on)
+})
+
+watch(() => state.measureEnabled, (on) => {
+  if (on) {
+    state.segEnabled = false
+    if (state.tool !== 'select') setTool('select')
+  }
+  viewer?.setMeasureEnabled(on)
 })
 watch(() => state.segMode, (mode) => viewer?.setSegMode(mode))
 watch(() => state.segOverwrite, (v) => viewer?.setSegOverwrite(v))

@@ -27,6 +27,16 @@
 - **多选与复制粘贴**：Ctrl+点击多选、Shift+点击列表范围选择、Ctrl+A 全选；支持批量删除/改类别、Ctrl+C/V 复制粘贴、Ctrl+Shift+V 原地粘贴；多选后按 W 可整体平移（混合选择时限制在 XY 平面）
 - **登录与角色权限**：标注员只能标注并可提交/撤销本帧审核；批注员只读标注、可添加批注并通过/打回待审核帧；管理员可标注、批注、审核并重新打开已通过帧。当前用户保存在 sessionStorage（每个标签页独立），纯前端演示账号。
 - **帧级批注与审核**：按帧添加批注，选中对象时批注会以气泡显示在对应标注上方；未关联对象的帧级批注显示在视口右上角。每帧独立提交/通过/打回：标注员提交本帧后锁定，批注员或管理员可通过、打回或标记批注已解决；管理员可重新打开已通过的帧。支持**提交全部/撤销全部/全部通过**，批量操作只写一次存储；空帧也会一起提交，确认框会提示空帧数量。支持提交轮次、审核历史、本轮对象 diff、撤销提交与「定位到批注/对象」。批注与审核状态按数据集保存在 localStorage，并随「导出数据」一并导出；两个标签页可分别登录标注员和批注员实时联调（身份保存在 sessionStorage）。
+- **审核工作台**：列出所有帧的状态、轮次、批注/未解决数、本轮 diff，支持状态筛选、搜索、跳转和批量操作；“统计”页展示通过率、平均轮次、审核耗时、打回原因分类和人员工作量，可导出统计 JSON
+- **批注讨论与状态**：批注支持回复（所有登录角色可参与）、编辑/删除自己的批注、标记“待处理/处理中/已完成”；打回时可选择原因分类（漏标/框不准/类别错/尺寸错/点标签错/其他），统计页按分类汇总
+- **演示引导**：工具栏「更多 → 演示引导」按加载数据、标注、提交、批注、批量操作、时间轴、讨论的顺序讲解完整流程
+- **AI 预标注建议（mock）**：工具栏「AI 建议」基于当前帧真值/现有对象生成“新增/优化”候选，支持接受、忽略、接受全部。当前为演示模型，预留真实推理接口替换位置
+- **轨迹插值**：选中带 `trackId` 的 3D 框后，可在前后已标注帧之间补齐缺失帧位姿（含朝向最短路径插值），锁定帧自动跳过
+- **框内点云自动分割**：属性面板「框内点自动分割」把 3D 框内的点批量归为该框类别，复用点标签撤销/持久化机制
+- **标注质量检查**：检查框悬空/未贴地、尺寸异常、同类框重叠、同帧重复 track、轨迹跳变，问题可定位并导出报告
+- **测量工具**：工具栏「测量」后依次点击两个点云点，显示距离、水平距离和高差，`Esc`/再次退出清除
+- **版本快照**：提交/通过时自动把当前帧标注对象写入 IndexedDB（每帧保留最近 10 个版本），支持查看、与当前 diff、回滚；不保存点级标签
+- **2D 图像联动**：支持 `scene.json` 里的 `camera.intrinsics` 和 `frames[].image`；图像上投影 3D 框，点击 2D 框选中 3D 对象。示例数据可用 `npm run gen:images` 生成合成相机图像
 - **自动加载全量真值**：示例数据集加载后自动导入所有帧的真值框/标线（urban 约 2,490、highway 约 6,560、crossing 约 7,400 个对象）；可点击「重新导入真值」覆盖恢复
 - **导入导出**：KITTI `.txt`、项目标注 `.json`、点级标签 `.json`
 - **导出数据**：工具栏「导出」导出所有帧的框/标线、已编辑的点级标签与批注/审核记录为 JSON；未配置 `VITE_SAVE_API` 时直接下载，不再提示后端未配置
@@ -39,6 +49,7 @@
 ```bash
 npm install
 npm run gen:test-data -- --formats bin   # 生成 3 份 bin-only 数据集（约 1.15GB，已 gitignore）
+npm run gen:images -- --only urban       # 为 2D 图像联动生成合成相机图像（SVG）
 npm run fetch:test-data                  # 下载真实单帧样本到 public/test-data/real
 npm run dev
 ```
@@ -77,6 +88,7 @@ npm run build
 合计 190 帧 / 约 6900 万点 / 约 1.1GB（bin-only，单帧约 6MB）。用于压测大点云下的加载与交互体验。
 
 - 每个数据集：`public/test-data/datasets/<id>/frame_XXXXXX.{bin,pcd,ply}`（默认同源三种格式；演示部署用 `--formats bin` 只保留 bin）+ `labels/frame_XXXXXX.json` 逐帧真值 + `labels/all.json` 全量真值 + `point_labels/markings.json` 标线点级标签 + `scene.json`
+- 2D 图像（可选）：`npm run gen:images -- --only urban` 读取现有 `.bin` 帧，生成 `images/frame_XXXXXX.svg` 合成相机图像，并把 `camera.intrinsics` 与 `frames[].image` 写入 `scene.json`；不需要重新生成点云
 - 标线点云：高反射白色涂料点（强度明显高于地面），固定排在地面点之前，因此逐帧点级标签索引完全一致，一份 `markings.json` 被所有帧共用
 - 标线类别：`LaneLine`(6)、`Crosswalk`(7)、`RoadArrow`(8)、`StopLine`(9)
 - 汇总索引：`public/test-data/datasets/index.json`（供工具栏下拉使用，含各数据集标线统计）
@@ -96,6 +108,7 @@ npm run build
 | 右键拖拽 | 旋转视图 |
 | 滚轮 | 缩放 |
 | 单击 3D 框 / 标线 | 选中该对象 |
+| 测量模式单击两个点 | 显示距离、水平距离、高差 |
 | 拖拽黄色顶点手柄 | 移动标线顶点 |
 | `Alt+点击` 顶点 | 删除该顶点 |
 
@@ -151,8 +164,10 @@ npm run build
 src/
   stores/useAnnotationStore.js    # 帧/对象/类别/分割状态与导入导出
   stores/useAuthStore.js          # 演示登录与角色权限（sessionStorage）
-  stores/reviewCore.js            # 审核数据结构、帧状态与锁定判断
+  stores/reviewCore.js            # 审核/批注数据结构、状态、锁定与分类
   stores/useReviewStore.js        # 帧级提交/通过/打回、历史、跨标签同步
+  stores/useUiStore.js            # 工作台/引导/建议/质量/版本/2D 面板开关
+  stores/useSuggestionStore.js    # AI 预标注建议（mock）
   three/
     PointCloudViewer.js           # 场景、相机、控制器、点云、框、标线、分割
     loaders/index.js              # 格式分发与解析
@@ -162,11 +177,16 @@ src/
     save.js                       # 保存载荷组装与提交后端
     polyline.js                   # 折线/箭头模板几何（前端与测试数据生成共用）
     diff.js                       # 帧对象快照 / 签名 / 提交 diff
+    projection.js                 # 3D→2D 相机投影（2D 面板与合成图像共用）
+    qa.js                         # 标注质量检查规则
+    versionDb.js                  # 版本快照 IndexedDB
     actions.js io.js kitti.js math.js id.js
   components/                     # Toolbar / ObjectList / Properties / ClassManager
                                   # SegmentPanel / CommentPanel / LoginDialog
                                   # Viewer / Timeline / StatusBar
-scripts/                          # 测试数据生成与下载
+                                  # ReviewWorkbench / SuggestionPanel / QualityPanel
+                                  # VersionPanel / ImagePanel / DemoTour
+scripts/                          # 测试数据/合成图像生成与下载
 .env.example                      # 后端地址等配置模板
 ```
 

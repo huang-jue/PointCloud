@@ -15,6 +15,7 @@ import {
   clearSelection,
   classColor,
   syncTrackForward,
+  interpolateTrack,
   countTrackFrames,
   isMarking,
   setPolylinePoint,
@@ -131,6 +132,33 @@ function syncForward() {
   const n = syncTrackForward(obj.value.id)
   if (n) ElMessage.success(`已同步到之后 ${n} 帧`)
   else ElMessage.info('之后没有该物体的帧')
+}
+
+function interpolate() {
+  if (!obj.value) return
+  try {
+    const result = interpolateTrack(obj.value.id)
+    if (result.filled) {
+      ElMessage.success(`已在第 ${result.from + 1}～${result.to + 1} 帧之间补齐 ${result.filled} 帧`)
+    } else {
+      ElMessage.info('前后轨迹之间没有缺失帧')
+    }
+  } catch (err) {
+    ElMessage.warning(err.message || String(err))
+  }
+}
+
+function autoSegmentBox() {
+  const object = obj.value
+  if (!object || isMark.value) return
+  const count = viewerRef.current?.labelPointsInObject(object, object.classId) || 0
+  if (count) {
+    state.colorMode = 'label'
+    state.labelVersion++
+    ElMessage.success(`已把框内 ${count.toLocaleString()} 个点标为 ${object.type}`)
+  } else {
+    ElMessage.info('框内没有可标注的点（或都已有标签）')
+  }
 }
 </script>
 
@@ -291,6 +319,9 @@ function syncForward() {
         </div>
       </template>
 
+      <div v-if="!isMark" class="row" style="margin-top: 8px">
+        <el-button size="small" @click="autoSegmentBox">框内点自动分割</el-button>
+      </div>
       <div class="row" style="margin-top: 10px">
         <span class="obj-dot" :style="{ background: classColor(obj.classId) }"></span>
         <span class="hint">trackId {{ obj.trackId }} · {{ obj.source }}</span>
@@ -301,6 +332,7 @@ function syncForward() {
       </div>
       <div v-if="obj.trackId" class="row" style="margin-top: 8px">
         <el-button size="small" @click="syncForward">同步本帧位姿到后续帧</el-button>
+        <el-button v-if="!isMark" size="small" @click="interpolate">轨迹插值</el-button>
       </div>
     </template>
     </div>

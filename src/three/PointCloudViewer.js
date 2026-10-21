@@ -329,6 +329,13 @@ export class PointCloudViewer {
     this._projector = new THREE.Vector3() // 复用的投影临时向量
     this._screen = { x: 0, y: 0, z: 0 } // 复用的屏幕坐标，避免逐点分配对象
 
+    /* ---------- 测量工具 ---------- */
+    this.measureEnabled = false
+    this.measurePoints = []
+    this.measureGroup = new THREE.Group()
+    this.measureGroup.name = 'measure-group'
+    this.scene.add(this.measureGroup)
+
     /* ---------- 事件绑定 ---------- */
     this._onResize = this._onResize.bind(this)
     this._onPointerDown = this._onPointerDown.bind(this)
@@ -521,6 +528,11 @@ export class PointCloudViewer {
       this._suppressClick = false
       return
     }
+    if (this.measureEnabled) {
+      const moved = Math.hypot(event.clientX - this._down.x, event.clientY - this._down.y) > 4
+      if (!moved && event.button === 0) this._handleMeasureClick(event)
+      return
+    }
     if (this.drawMode) {
       const moved = Math.hypot(event.clientX - this._down.x, event.clientY - this._down.y) > 4
       if (!moved && event.button === 0) this._handleDrawClick(event)
@@ -624,6 +636,90 @@ export class PointCloudViewer {
     this.setSegEnabled(false)
     this.attachGizmo(null)
     this.showVertexHandles(null)
+  }
+
+  /** 开关测量模式：左键依次点击两个点 */
+  setMeasureEnabled(enabled) {
+    this.measureEnabled = !!enabled
+    if (this.measureEnabled) {
+      this.setDrawMode(null)
+      this.setSegEnabled(false)
+      this.attachGizmo(null)
+      this.controls.mouseButtons = { ...MOUSE_DEFAULT }
+    } else {
+      this.clearMeasure()
+    }
+  }
+
+  _clearMeasureVisuals() {
+    for (const child of this.measureGroup.children.slice()) {
+      if (child.isCSS2DObject) child.element?.remove?.()
+      child.geometry?.dispose?.()
+      child.material?.dispose?.()
+      this.measureGroup.remove(child)
+    }
+  }
+
+  clearMeasure() {
+    this.measurePoints = []
+    this._clearMeasureVisuals()
+    this.callbacks.onMeasure?.(null)
+  }
+
+  _handleMeasureClick(event) {
+    const local = this._localPoint(event)
+    const index = this._pickNearestPoint(local.x, local.y, 14, false)
+    if (index < 0 || !this.currentCloud) return
+    const pos = this.currentCloud.positions
+    const point = new THREE.Vector3(pos[index * 3], pos[index * 3 + 1], pos[index * 3 + 2])
+
+    if (!this.measurePoints.length) this._clearMeasureVisuals()
+    this.measurePoints.push(point)
+
+    const marker = new THREE.Mesh(
+      new THREE.SphereGeometry(0.08, 10, 8),
+      new THREE.MeshBasicMaterial({ color: 0xffd166, depthTest: false }),
+    )
+    marker.position.copy(point)
+    marker.renderOrder = 10
+    this.measureGroup.add(marker)
+
+    if (this.measurePoints.length < 2) {
+      this.callbacks.onMeasure?.({ pending: true })
+      return
+    }
+
+    const [a, b] = this.measurePoints
+    const dx = b.x - a.x
+    const dy = b.y - a.y
+    const dz = b.z - a.z
+    const distance = Math.hypot(dx, dy, dz)
+    const line = new THREE.Line(
+      new THREE.BufferGeometry().setFromPoints([a, b]),
+      new THREE.LineBasicMaterial({ color: 0xffd166, depthTest: false }),
+    )
+    line.renderOrder = 10
+    this.measureGroup.add(line)
+
+    const el = document.createElement('div')
+    el.className = 'pc-measure-label'
+    el.textContent = `${distance.toFixed(2)} m`
+    const label = new CSS2DObject(el)
+    label.position.copy(a).add(b).multiplyScalar(0.5)
+    label.position.z += 0.35
+    this.measureGroup.add(label)
+
+    this.measurePoints = []
+    this.callbacks.onMeasure?.({
+      distance,
+      horizontal: Math.hypot(dx, dy),
+      height: Math.abs(dz),
+      dx,
+      dy,
+      dz,
+      a: [a.x, a.y, a.z],
+      b: [b.x, b.y, b.z],
+    })
   }
 
   /** 进入/退出绘制模式（左键留给落点） */
@@ -1257,6 +1353,7 @@ export class PointCloudViewer {
 
   /** 用点云数据构建 BufferGeometry 并替换当前显示对象 */
   setCloud(cloud) {
+    this.clearMeasure()
     this.currentCloud = cloud
     const geometry = new THREE.BufferGeometry()
     geometry.setAttribute('position', new THREE.BufferAttribute(cloud.positions, 3))
@@ -1907,11 +2004,22 @@ export class PointCloudViewer {
     const cloud = this.currentCloud
     const mask = this.selectionMask
     if (!cloud || !mask) return 0
-    this._ensureWritableLabels(cloud)
     const indices = []
-    const skipExisting = !this.segOverwrite
     for (let i = 0; i < mask.length; i++) {
-      if (!mask[i]) continue
+      if (mask[i]) indices.push(i)
+    }
+    return this._commitIndicesToLabel(indices, classId)
+  }
+
+  /** 把一组点索引提交为一个新的标签片段（框内自动分割也复用） */
+  _commitIndicesToLabel(indicesInput, classId) {
+    const cloud = this.currentCloud
+    if (!cloud || !indicesInput?.length) return 0
+    this._ensureWritableLabels(cloud)
+    const skipExisting = !this.segOverwrite
+    const indices = []
+    for (const i of indicesInput) {
+      if (!Number.isInteger(i) || i < 0 || i >= cloud.pointCount) continue
       // 不覆盖模式：已经标注过的点保持原标签
       if (skipExisting && cloud.pointLabels[i] >= 0) continue
       indices.push(i)
@@ -1942,6 +2050,34 @@ export class PointCloudViewer {
     this.refreshColors()
     this._persistLabels(cloud)
     return indices.length
+  }
+
+  /**
+   * 选中 3D 框后把框内点自动归为该类别。
+   * @param {object} obj 3D 框（世界坐标 + ry）
+   * @param {number} classId
+   */
+  labelPointsInObject(obj, classId) {
+    const cloud = this.currentCloud
+    if (!cloud || !obj || obj.shape === 'line' || obj.shape === 'arrow') return 0
+    const pos = cloud.positions
+    const n = cloud.pointCount
+    const cos = Math.cos(obj.ry || 0)
+    const sin = Math.sin(obj.ry || 0)
+    const halfL = Math.abs(obj.l || 0) / 2
+    const halfW = Math.abs(obj.w || 0) / 2
+    const halfH = Math.abs(obj.h || 0) / 2
+    const indices = []
+    for (let i = 0; i < n; i++) {
+      const dx = pos[i * 3] - obj.x
+      const dy = pos[i * 3 + 1] - obj.y
+      const dz = pos[i * 3 + 2] - obj.z
+      if (Math.abs(dz) > halfH) continue
+      const lx = cos * dx + sin * dy
+      const ly = -sin * dx + cos * dy
+      if (Math.abs(lx) <= halfL && Math.abs(ly) <= halfW) indices.push(i)
+    }
+    return this._commitIndicesToLabel(indices, classId)
   }
 
   /**
