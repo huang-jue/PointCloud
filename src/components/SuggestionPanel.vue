@@ -73,7 +73,9 @@ function rejectAll() {
   <el-dialog v-model="open" title="AI 预标注建议" width="460px" append-to-body>
     <div class="sug-head">
       <div>
-        <el-tag size="small" type="warning" effect="plain">演示模型</el-tag>
+        <el-tag size="small" :type="suggestionState.source === 'model' ? 'success' : 'warning'" effect="plain">
+          {{ suggestionState.source === 'model' ? '推理模型' : '演示模型' }}
+        </el-tag>
         <span class="hint" style="margin-left: 6px">{{ frameLabel }}</span>
       </div>
       <span class="hint">
@@ -85,7 +87,7 @@ function rejectAll() {
     <div v-else-if="suggestionState.loading" class="hint sug-empty">正在生成建议…</div>
     <div v-else-if="suggestionState.error" class="hint sug-empty">{{ suggestionState.error }}</div>
     <div v-else-if="!suggestionState.items.length" class="hint sug-empty">
-      本帧暂无可用的 mock 建议；可以切换帧或先清空本帧标注再试。
+      本帧暂无建议；可以切换帧，或配置 VITE_PREDICT_API 接入真实推理服务。
     </div>
     <div v-else class="sug-list">
       <div v-for="item in suggestionState.items" :key="item.id" class="sug-item">

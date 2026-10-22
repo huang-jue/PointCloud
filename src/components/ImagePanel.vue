@@ -1,6 +1,6 @@
 <script setup>
 /** 2D 相机图像联动：显示当前帧合成/真实图像，并把 3D 框投影到图像上 */
-import { computed } from 'vue'
+import { computed, ref } from 'vue'
 import { state, currentFrame, selectObject } from '../stores/useAnnotationStore.js'
 import { uiState } from '../stores/useUiStore.js'
 import { BOX_EDGES, buildExtrinsics, convexHull, pointInPolygon, projectBox } from '../utils/projection.js'
@@ -11,6 +11,52 @@ const open = computed({
     uiState.imageOpen = value
   },
 })
+
+const zoomEl = ref(null)
+const scale = ref(1)
+const tx = ref(0)
+const ty = ref(0)
+const panning = ref(false)
+let panStart = null
+let suppressClick = false
+
+function resetView() {
+  scale.value = 1
+  tx.value = 0
+  ty.value = 0
+}
+
+function onWheel(event) {
+  const factor = event.deltaY < 0 ? 1.15 : 0.87
+  scale.value = Math.min(8, Math.max(0.5, scale.value * factor))
+}
+
+function startPan(event) {
+  if (event.button !== 0) return
+  panning.value = true
+  suppressClick = false
+  panStart = { x: event.clientX - tx.value, y: event.clientY - ty.value, moved: false }
+  window.addEventListener('pointermove', onPan)
+  window.addEventListener('pointerup', endPan, { once: true })
+}
+
+function onPan(event) {
+  if (!panning.value || !panStart) return
+  const nextX = event.clientX - panStart.x
+  const nextY = event.clientY - panStart.y
+  if (Math.abs(nextX - tx.value) > 3 || Math.abs(nextY - ty.value) > 3) {
+    panStart.moved = true
+    suppressClick = true
+  }
+  tx.value = nextX
+  ty.value = nextY
+}
+
+function endPan() {
+  panning.value = false
+  panStart = null
+  window.removeEventListener('pointermove', onPan)
+}
 
 const intrinsics = computed(() => state.camera?.intrinsics || null)
 const extrinsics = computed(() =>
@@ -43,8 +89,12 @@ const projected = computed(() => {
 })
 
 function onClick(event) {
-  if (!intrinsics.value) return
-  const rect = event.currentTarget.getBoundingClientRect()
+  if (suppressClick) {
+    suppressClick = false
+    return
+  }
+  if (!intrinsics.value || !zoomEl.value) return
+  const rect = zoomEl.value.getBoundingClientRect()
   const x = ((event.clientX - rect.left) / rect.width) * intrinsics.value.width
   const y = ((event.clientY - rect.top) / rect.height) * intrinsics.value.height
   for (let i = projected.value.length - 1; i >= 0; i--) {
@@ -68,34 +118,45 @@ function onClick(event) {
     <div v-else-if="!intrinsics || !extrinsics" class="hint image-empty">
       当前数据集缺少相机内参/位姿，无法投影。
     </div>
-    <div v-else class="image-stage" @click="onClick">
-      <img :src="imageUrl" alt="camera frame" draggable="false" />
-      <svg
-        class="image-overlay"
-        :viewBox="`0 0 ${intrinsics.width} ${intrinsics.height}`"
-        preserveAspectRatio="none"
+    <div v-else class="image-stage" @wheel.prevent="onWheel" @mousedown="startPan">
+      <div
+        ref="zoomEl"
+        class="image-zoom"
+        :style="{ transform: `translate(${tx}px, ${ty}px) scale(${scale})` }"
+        @click="onClick"
       >
-        <g v-for="box in projected" :key="box.id">
-          <polygon
-            :points="box.polygon"
-            :class="{ selected: box.selected }"
-            class="box-fill"
-          />
-          <line
-            v-for="(edge, i) in box.edges"
-            :key="i"
-            :x1="edge.x1"
-            :y1="edge.y1"
-            :x2="edge.x2"
-            :y2="edge.y2"
-            :class="{ selected: box.selected }"
-            class="box-edge"
-          />
-        </g>
-      </svg>
+        <img :src="imageUrl" alt="camera frame" draggable="false" />
+        <svg
+          class="image-overlay"
+          :viewBox="`0 0 ${intrinsics.width} ${intrinsics.height}`"
+          preserveAspectRatio="none"
+        >
+          <g v-for="box in projected" :key="box.id">
+            <polygon
+              :points="box.polygon"
+              :class="{ selected: box.selected }"
+              class="box-fill"
+            />
+            <line
+              v-for="(edge, i) in box.edges"
+              :key="i"
+              :x1="edge.x1"
+              :y1="edge.y1"
+              :x2="edge.x2"
+              :y2="edge.y2"
+              :class="{ selected: box.selected }"
+              class="box-edge"
+            />
+          </g>
+        </svg>
+      </div>
+      <div class="image-zoom-bar">
+        <span>{{ (scale * 100).toFixed(0) }}%</span>
+        <el-button link size="small" @click.stop="resetView">重置视图</el-button>
+      </div>
     </div>
     <div v-if="imageUrl" class="hint image-foot">
-      {{ currentFrame?.name }} · 点击 2D 框可选中对应 3D 对象；3D 中选中的框会高亮。
+      {{ currentFrame?.name }} · 滚轮缩放、拖拽平移；点击 2D 框可选中对应 3D 对象；3D 中选中的框会高亮。
     </div>
   </el-dialog>
 </template>
@@ -113,7 +174,32 @@ function onClick(event) {
   border: 1px solid var(--border);
   border-radius: 6px;
   overflow: hidden;
-  cursor: crosshair;
+  cursor: grab;
+}
+
+.image-stage:active {
+  cursor: grabbing;
+}
+
+.image-zoom {
+  position: relative;
+  width: 100%;
+  transform-origin: 0 0;
+  will-change: transform;
+}
+
+.image-zoom-bar {
+  position: absolute;
+  right: 10px;
+  bottom: 10px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 3px 8px;
+  border-radius: 4px;
+  background: rgba(6, 9, 13, 0.72);
+  color: var(--text-dim);
+  font-size: 11px;
 }
 
 .image-stage img {

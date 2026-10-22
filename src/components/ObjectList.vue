@@ -3,7 +3,7 @@
  * ObjectList —— 左侧当前帧标注对象列表
  * 单击选中、双击把视口焦点移到该对象、右侧按钮删除（多帧物体走确认流程）
  */
-import { watch } from 'vue'
+import { computed, ref, watch } from 'vue'
 import {
   state,
   currentObjects,
@@ -19,6 +19,33 @@ import { polylineLength } from '../utils/polyline.js'
 import { canEditCurrentFrame } from '../stores/useReviewStore.js'
 
 let anchorId = null
+const PAGE_SIZE = 200
+const keyword = ref('')
+const classFilter = ref(null)
+const limit = ref(PAGE_SIZE)
+
+/** 过滤后仍保留全部对象，超出上限只渲染前 limit 条，避免大帧卡顿 */
+const filteredObjects = computed(() => {
+  const text = keyword.value.trim().toLowerCase()
+  return currentObjects.value.filter((obj) => {
+    if (classFilter.value !== null && classFilter.value !== undefined && obj.classId !== classFilter.value) {
+      return false
+    }
+    if (!text) return true
+    return `${obj.type || ''} ${obj.trackId || ''} ${obj.source || ''}`.toLowerCase().includes(text)
+  })
+})
+
+const visibleObjects = computed(() => filteredObjects.value.slice(0, limit.value))
+const hasMore = computed(() => filteredObjects.value.length > visibleObjects.value.length)
+
+watch(
+  () => [state.datasetName, state.currentIndex, keyword.value, classFilter.value],
+  () => {
+    anchorId = null
+    limit.value = PAGE_SIZE
+  },
+)
 
 /** 对象列表点击：普通单选、Ctrl 切换、Shift 范围选择 */
 function onItemClick(obj, event) {
@@ -47,13 +74,6 @@ function selectAll() {
 function isSelected(id) {
   return state.selectedObjectIds.includes(id)
 }
-
-watch(
-  () => [state.datasetName, state.currentIndex],
-  () => {
-    anchorId = null
-  },
-)
 
 /** 双击让视口聚焦到该对象 */
 function focusObject(obj) {
@@ -113,17 +133,32 @@ function remove(obj) {
           取消选择
         </el-button>
       </div>
+      <div v-if="currentObjects.length" class="obj-filters">
+        <el-input
+          v-model="keyword"
+          size="small"
+          placeholder="搜索类型 / trackId"
+          clearable
+          style="width: 100%"
+        />
+        <el-select v-model="classFilter" size="small" placeholder="全部类别" clearable style="width: 100%">
+          <el-option v-for="c in state.classes" :key="c.id" :label="c.name" :value="c.id" />
+        </el-select>
+      </div>
+      <div v-if="keyword || classFilter !== null" class="hint" style="margin-top: 4px">
+        匹配 {{ filteredObjects.length }} / {{ currentObjects.length }} 个对象
+      </div>
     </div>
     <el-scrollbar class="panel-scroll">
       <el-empty
-        v-if="!currentObjects.length"
+        v-if="!filteredObjects.length"
         class="list-empty"
         :image-size="60"
-        description="本帧暂无标注"
+        :description="currentObjects.length ? '没有匹配的对象' : '本帧暂无标注'"
       />
       <template v-else>
         <div
-          v-for="obj in currentObjects"
+          v-for="obj in visibleObjects"
           :key="obj.id"
           class="obj-item"
           :class="{ selected: isSelected(obj.id) }"
@@ -144,6 +179,11 @@ function remove(obj) {
           </div>
           <el-button v-if="canEditCurrentFrame" link type="danger" @click.stop="remove(obj)">
             <el-icon><Close /></el-icon>
+          </el-button>
+        </div>
+        <div v-if="hasMore" class="obj-more">
+          <el-button link size="small" @click="limit += PAGE_SIZE">
+            显示更多（剩余 {{ filteredObjects.length - visibleObjects.length }}）
           </el-button>
         </div>
       </template>

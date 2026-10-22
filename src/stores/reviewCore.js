@@ -56,6 +56,8 @@ export const reviewState = reactive({
   workflows: {},
   comments: [],
   updatedAt: 0,
+  storageError: '',
+  mergeWarning: '',
 })
 
 export function defaultWorkflow() {

@@ -1,0 +1,6 @@
+dist
+node_modules
+public/test-data
+public/favicon.svg
+package-lock.json
+coverage

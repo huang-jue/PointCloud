@@ -77,6 +77,24 @@ export function checkFrame(frame, frameIndex, { sensorHeight = 1.73, groundToler
     if (obj.l <= 0 || obj.w <= 0 || obj.h <= 0) {
       push(obj, 'error', 'size', `框尺寸非正：${obj.l}×${obj.w}×${obj.h}`)
     }
+    if (
+      obj.truncated !== undefined &&
+      (!isFiniteNumber(obj.truncated) || obj.truncated < 0 || obj.truncated > 1)
+    ) {
+      push(obj, 'warning', 'truncated', `截断比例应在 0~1，当前 ${obj.truncated}`)
+    }
+    if (
+      obj.occluded !== undefined &&
+      (!isFiniteNumber(obj.occluded) || obj.occluded < 0 || obj.occluded > 3)
+    ) {
+      push(obj, 'warning', 'occluded', `遮挡等级应在 0~3，当前 ${obj.occluded}`)
+    }
+    if (
+      obj.score !== undefined &&
+      (!isFiniteNumber(obj.score) || obj.score < 0 || obj.score > 1)
+    ) {
+      push(obj, 'warning', 'score', `置信度应在 0~1，当前 ${obj.score}`)
+    }
     const ground = -Math.abs(sensorHeight)
     const bottom = obj.z - obj.h / 2
     if (Math.abs(bottom - ground) > groundTolerance) {

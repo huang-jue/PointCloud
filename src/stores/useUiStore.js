@@ -8,6 +8,9 @@ export const uiState = reactive({
   suggestionsOpen: false,
   qualityOpen: false,
   imageOpen: false,
+  tracksOpen: false,
+  shortcutsOpen: false,
+  rightTab: 'review',
 })
 
 export function openUi(name) {

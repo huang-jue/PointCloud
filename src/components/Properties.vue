@@ -19,6 +19,7 @@ import {
   countTrackFrames,
   isMarking,
   setPolylinePoint,
+  insertPolylinePoint,
   deletePolylinePoint,
   rotatePolyline,
   scalePolyline,
@@ -50,7 +51,7 @@ const trackFrames = computed(() => (obj.value?.trackId ? countTrackFrames(obj.va
 
 /** 偏航角以「度」展示/输入，内部存弧度 */
 const ryDeg = computed({
-  get: () => (obj.value ? Number(radToDeg(obj.value.ry).toFixed(1)) : 0),
+  get: () => (obj.value ? Number(radToDeg(obj.value.ry ?? 0).toFixed(1)) : 0),
   set: (v) => obj.value && updateObject(obj.value.id, { ry: degToRad(Number(v)) }),
 })
 
@@ -106,6 +107,14 @@ function removePoint(pathIndex, index) {
   if (!obj.value) return
   if (!deletePolylinePoint(obj.value.id, index, pathIndex)) {
     ElMessage.warning('至少需要保留 2 个顶点')
+  }
+}
+
+/** 在顶点 i 与 i+1 之间插入中点 */
+function insertPoint(pathIndex, index) {
+  if (!obj.value) return
+  if (!insertPolylinePoint(obj.value.id, index, pathIndex)) {
+    ElMessage.warning('只能在两个相邻顶点之间插入')
   }
 }
 
@@ -287,6 +296,16 @@ function autoSegmentBox() {
               <el-button link type="danger" size="small" @click="removePoint(path.pathIndex, i)">
                 <el-icon><Close /></el-icon>
               </el-button>
+              <el-button
+                v-if="i < path.points.length - 1"
+                link
+                type="primary"
+                size="small"
+                title="在下一个顶点前插入中点"
+                @click="insertPoint(path.pathIndex, i)"
+              >
+                <el-icon><Plus /></el-icon>
+              </el-button>
             </div>
           </div>
         </div>
@@ -298,7 +317,7 @@ function autoSegmentBox() {
           <div v-for="f in FIELDS" :key="f.key" class="field">
             <label>{{ f.label }}</label>
             <el-input-number
-              :model-value="Number(obj[f.key].toFixed(4))"
+              :model-value="Number(Number(obj[f.key] ?? 0).toFixed(4))"
               :step="0.1"
               :controls="false"
               size="small"
@@ -314,6 +333,61 @@ function autoSegmentBox() {
               :controls="false"
               size="small"
               style="width: 100%"
+            />
+          </div>
+        </div>
+        <div class="hint" style="margin-top: 10px; margin-bottom: 4px">KITTI / 质量属性</div>
+        <div class="grid-2">
+          <div class="field">
+            <label>截断 truncated</label>
+            <el-input-number
+              :model-value="Number(obj.truncated ?? 0)"
+              :step="0.1"
+              :min="0"
+              :max="1"
+              :controls="false"
+              size="small"
+              style="width: 100%"
+              @change="(v) => setField('truncated', v)"
+            />
+          </div>
+          <div class="field">
+            <label>遮挡 occluded</label>
+            <el-input-number
+              :model-value="Number(obj.occluded ?? 0)"
+              :step="1"
+              :min="0"
+              :max="3"
+              :controls="false"
+              size="small"
+              style="width: 100%"
+              @change="(v) => setField('occluded', v)"
+            />
+          </div>
+          <div class="field">
+            <label>观测角 alpha°</label>
+            <el-input-number
+              :model-value="Number(obj.alpha ?? 0)"
+              :step="5"
+              :min="-180"
+              :max="180"
+              :controls="false"
+              size="small"
+              style="width: 100%"
+              @change="(v) => setField('alpha', v)"
+            />
+          </div>
+          <div class="field">
+            <label>置信度 score</label>
+            <el-input-number
+              :model-value="Number(obj.score ?? 1)"
+              :step="0.05"
+              :min="0"
+              :max="1"
+              :controls="false"
+              size="small"
+              style="width: 100%"
+              @change="(v) => setField('score', v)"
             />
           </div>
         </div>

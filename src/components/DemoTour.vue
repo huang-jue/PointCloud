@@ -53,7 +53,11 @@ const steps = [
 watch(
   () => uiState.tourOpen,
   (open) => {
-    if (open) current.value = 0
+    if (open) {
+      current.value = 0
+      // 引导里的批注/审核步骤都在「审核」标签页内
+      uiState.rightTab = 'review'
+    }
   },
 )
 

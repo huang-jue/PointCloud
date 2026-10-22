@@ -9,6 +9,7 @@ import { ref, computed, watch, onMounted, onBeforeUnmount, nextTick } from 'vue'
 import { PointCloudViewer } from '../three/PointCloudViewer.js'
 import { viewerRef } from '../three/viewerRef.js'
 import { canEditCurrentFrame, reviewState } from '../stores/useReviewStore.js'
+import { flushDrafts } from '../stores/useDraftStore.js'
 import {
   state,
   currentFrame,
@@ -25,6 +26,7 @@ import {
   setPolylinePoint,
   deletePolylinePoint,
   setTool,
+  markFrameEdited,
 } from '../stores/useAnnotationStore.js'
 
 const viewportEl = ref(null)
@@ -50,6 +52,7 @@ let fitPending = true // 新数据集加载后是否需要自动适应视角
 let currentSketch = null
 let loadingTimer = null
 let syncRaf = 0
+let lastDataset = ''
 
 /** 开始加载：延迟 150ms 再显示遮罩，避免缓存命中时闪烁 */
 function beginLoading(token) {
@@ -160,6 +163,7 @@ async function loadCurrent() {
       viewer.pointObject = null
       viewer.pointGeometry = null
       viewer.currentCloud = null
+      viewer.currentKey = null
     }
     return
   }
@@ -243,7 +247,7 @@ function onSketch(sketch) {
 }
 
 /** 拖拽文件到视口加载点云 */
-function onDrop(event) {
+async function onDrop(event) {
   dragging.value = false
   const files = Array.from(event.dataTransfer?.files || []).filter((f) =>
     /\.(pcd|ply|bin|las|laz|xyz|csv|txt)$/i.test(f.name),
@@ -252,6 +256,7 @@ function onDrop(event) {
     state.error = '未识别到支持的点云文件'
     return
   }
+  await flushDrafts().catch(() => {})
   fitPending = true
   loadLocalFiles(files)
 }
@@ -287,6 +292,10 @@ onMounted(() => {
     // 点标签后台加载完成后刷新分割统计
     onLabelsLoaded: () => {
       state.labelVersion++
+    },
+    // 任何点标签编辑都进入草稿自动保存
+    onLabelsChanged: () => {
+      markFrameEdited()
     },
     getClasses: () => state.classes, // 供标签着色使用
     getActiveClassId: () => state.activeClassId, // 自动赋标签所用类别
@@ -334,6 +343,11 @@ watch(
   // 数据集切换（名称或帧数变化）后需要重新适应视角
   () => state.datasetName + '#' + state.frames.length,
   () => {
+    if (state.datasetName !== lastDataset) {
+      lastDataset = state.datasetName
+      // 旧数据集的点云/标签缓存不再需要，释放内存与 LRU 名额
+      viewer?.clearCache()
+    }
     fitPending = true
     viewer?.clearPrefetch()
     loadCurrent()

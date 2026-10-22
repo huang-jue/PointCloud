@@ -30,16 +30,23 @@
 - **审核工作台**：列出所有帧的状态、轮次、批注/未解决数、本轮 diff，支持状态筛选、搜索、跳转和批量操作；“统计”页展示通过率、平均轮次、审核耗时、打回原因分类和人员工作量，可导出统计 JSON
 - **批注讨论与状态**：批注支持回复（所有登录角色可参与）、编辑/删除自己的批注、标记“待处理/处理中/已完成”；打回时可选择原因分类（漏标/框不准/类别错/尺寸错/点标签错/其他），统计页按分类汇总
 - **演示引导**：工具栏「更多 → 演示引导」按加载数据、标注、提交、批注、批量操作、时间轴、讨论的顺序讲解完整流程
-- **AI 预标注建议（mock）**：工具栏「AI 建议」基于当前帧真值/现有对象生成“新增/优化”候选，支持接受、忽略、接受全部。当前为演示模型，预留真实推理接口替换位置
+- **AI 预标注建议**：工具栏「AI 建议」优先调用 `VITE_PREDICT_API`（POST，返回 `suggestions` 数组），未配置或失败时回退到内置演示模型；支持接受、忽略、接受全部
+- **轨迹管理**：工具栏「更多 → 轨迹管理与搜索」按 trackId 汇总所有帧，支持定位、同步位姿、从当前帧拆分、合并到目标轨迹、删除整条轨迹；对象搜索可按类型/trackId/id、类别、来源跨帧定位
 - **轨迹插值**：选中带 `trackId` 的 3D 框后，可在前后已标注帧之间补齐缺失帧位姿（含朝向最短路径插值），锁定帧自动跳过
 - **框内点云自动分割**：属性面板「框内点自动分割」把 3D 框内的点批量归为该框类别，复用点标签撤销/持久化机制
-- **标注质量检查**：检查框悬空/未贴地、尺寸异常、同类框重叠、同帧重复 track、轨迹跳变，问题可定位并导出报告
-- **测量工具**：工具栏「测量」后依次点击两个点云点，显示距离、水平距离和高差，`Esc`/再次退出清除
+- **标注质量检查**：检查框悬空/未贴地、尺寸异常、同类框重叠、同帧重复 track、轨迹跳变，以及截断/遮挡/置信度范围；问题可定位并导出报告
+- **测量工具**：工具栏「测量」后依次点击两个点云点，显示距离、水平距离和高差；可连续测量多段，关闭测量时统一清除
 - **版本快照**：提交/通过时自动把当前帧标注对象写入 IndexedDB（每帧保留最近 10 个版本），支持查看、与当前 diff、回滚；不保存点级标签
-- **2D 图像联动**：支持 `scene.json` 里的 `camera.intrinsics` 和 `frames[].image`；图像上投影 3D 框，点击 2D 框选中 3D 对象。示例数据可用 `npm run gen:images` 生成合成相机图像
+- **右侧工作区**：审核、对象属性、类别、点级分割拆成四个标签页，批注员只显示审核页；标签上显示未解决批注数、选中对象数、当前类别色和分割开关状态
+- **本地草稿自动保存**：编辑后约 0.8 秒写入 IndexedDB（对象 + 点标签 + 类别表），切帧/页面隐藏时立即保存；刷新后自动恢复，状态栏显示「草稿已保存」；工具栏「更多 → 清除本地草稿」可删除
+- **撤销/重做**：Ctrl+Z / Ctrl+Shift+Z 覆盖添加、删除、拖动/属性修改、批量平移、粘贴、清空、轨迹插值、多帧传播等标注编辑；涉及已提交/已通过帧时拒绝执行
+- **2D 图像联动**：支持 `scene.json` 里的 `camera.intrinsics` 和 `frames[].image`；图像上投影 3D 框，点击 2D 框选中 3D 对象；支持滚轮缩放、拖拽平移和重置视图。示例数据可用 `npm run gen:images` 生成合成相机图像
 - **自动加载全量真值**：示例数据集加载后自动导入所有帧的真值框/标线（urban 约 2,490、highway 约 6,560、crossing 约 7,400 个对象）；可点击「重新导入真值」覆盖恢复
-- **导入导出**：KITTI `.txt`、项目标注 `.json`、点级标签 `.json`
-- **导出数据**：工具栏「导出」导出所有帧的框/标线、已编辑的点级标签与批注/审核记录为 JSON；未配置 `VITE_SAVE_API` 时直接下载，不再提示后端未配置
+- **导入导出**：KITTI `.txt`、项目标注 `.json`、点级标签 `.json`；工具栏「更多 → 导出数据集 ZIP」一次打包项目 JSON、逐帧 KITTI 文本和已编辑点标签
+- **质量属性**：3D 框属性面板可编辑 `truncated / occluded / alpha / score`，KITTI 导出会带上这些字段，QA 会校验取值范围
+- **视角预设**：工具栏「显示 → 视角」提供俯视/前视/侧视/等轴，俯视适合检查车道线与停止线
+- **标线编辑增强**：属性面板顶点列表可在相邻顶点间插入中点；拖拽顶点、Alt+点击删除保持不变
+- **导出数据**：工具栏「导出」导出所有帧的框/标线、已编辑的点级标签与批注/审核记录为 JSON；未配置 `VITE_SAVE_API` 时直接下载，不再提示后端未配置。点级标签 v2 只导出 `segments`，避免 40 万点数组导致的超大 JSON
 - **可拖拽**：直接把点云文件拖入视口加载
 - **视口操作**：左键拖拽平移、右键拖拽旋转、滚轮缩放（分割模式下左键用于框选，中键平移）
 - 坐标约定：Z 轴向上，传感器位于原点（道路场景地面位于 `z = -sensorHeight`）
@@ -53,6 +60,19 @@ npm run gen:images -- --only urban       # 为 2D 图像联动生成合成相机
 npm run fetch:test-data                  # 下载真实单帧样本到 public/test-data/real
 npm run dev
 ```
+
+代码质量与测试：
+
+```bash
+npm run lint        # ESLint（Vue 3 + flat config）
+npm run test        # Vitest watch
+npm run test:run    # 单元测试：kitti / diff / qa / polyline / reviewCore / zip / draft labels
+npm run verify      # lint + 单元测试 + 生产构建
+npm run build
+npm run smoke       # 可选：用系统 Edge/Chrome 对构建产物做冒烟测试（需要本机浏览器）
+```
+
+`npm run smoke` 会打开示例数据集，验证添加框、撤销、自动草稿保存与刷新恢复，并检查轨迹/快捷键弹窗是否产生运行时错误。
 
 开发/部署都在 `/base/` 子路径下：
 
@@ -133,7 +153,8 @@ npm run build
 | `Ctrl+D` | 原地复制选中对象 |
 | `Delete` | 删除选中对象（多帧物体将提示是否从本帧起截断后续帧） |
 | `Esc` | 清空对象选择（绘制中为取消草稿） |
-| `Ctrl+Z` | 撤销上一步点标签 |
+| `Ctrl+Z` | 撤销标注编辑（分割模式下优先撤销点标签） |
+| `Ctrl+Shift+Z` / `Ctrl+Y` | 重做标注编辑 |
 
 ## 角色与批注流程
 
@@ -158,16 +179,33 @@ npm run build
 
 批注与审核数据按数据集保存在 `localStorage`（`pc-annotate-review:<dataset>`），结构为 `schemaVersion=2` 的 `workflows`（按帧）+ `comments`，包含提交轮次、历史、提交时快照和 diff。旧版整集审核记录会在首次读取时自动迁移到每一帧。「导出数据」会把批注、审核状态和历史一起写入 JSON。
 
+## 本地草稿与撤销
+
+- 编辑标注对象或点标签后约 0.8 秒写入 IndexedDB `pc-annotate-drafts`（按数据集 + 帧），切帧、页面隐藏、关闭页面前会立即 flush；状态栏显示「草稿保存中 / 草稿已保存 / 草稿未保存」
+- 刷新页面后，在示例数据集全量真值导入完成后自动恢复草稿的对象、点标签和类别表；工具栏「更多 → 清除本地草稿」可删除当前数据集草稿
+- 点标签缓存不再静默淘汰未保存帧：超过上限时优先淘汰已写入草稿的帧
+- Ctrl+Z / Ctrl+Shift+Z（或 Ctrl+Y）撤销/重做标注编辑；涉及已提交/已通过帧时拒绝执行。点标签撤销仍使用视口内的操作级差分历史
+- 多标签页审核记录仍是 localStorage 合并（按 `updatedAt` 较新者优先），出现同一帧「通过 vs 打回」并发终态时会提示冲突；localStorage 容量不足会明确提示，不再静默失败
+
+## 性能说明
+
+- 视口按需渲染：相机移动、gizmo 拖拽、标注/点标签变化时才提交 GPU；`?perf=1` 强制连续渲染并显示 FPS
+- 点标签点选使用已标注点稀疏索引，避免每次点击投影 40 万点
+- 切换数据集会清空点云/标签缓存；对象列表支持关键字/类别过滤和分批渲染
+- 构建按 `three` / `element-plus` / `@loaders.gl` / `vue` 分包，图标改为按需注册；示例数据仍会复制进 `dist`，正式部署建议外置或使用 CDN
+
 ## 目录结构
 
 ```
 src/
   stores/useAnnotationStore.js    # 帧/对象/类别/分割状态与导入导出
+  stores/useHistoryStore.js       # 标注编辑撤销/重做（操作级差分）
+  stores/useDraftStore.js         # IndexedDB 草稿自动保存/恢复
   stores/useAuthStore.js          # 演示登录与角色权限（sessionStorage）
   stores/reviewCore.js            # 审核/批注数据结构、状态、锁定与分类
   stores/useReviewStore.js        # 帧级提交/通过/打回、历史、跨标签同步
-  stores/useUiStore.js            # 工作台/引导/建议/质量/版本/2D 面板开关
-  stores/useSuggestionStore.js    # AI 预标注建议（mock）
+  stores/useUiStore.js            # 工作台/引导/建议/质量/版本/轨迹/快捷键面板开关
+  stores/useSuggestionStore.js    # AI 预标注建议（真实接口或 mock）
   three/
     PointCloudViewer.js           # 场景、相机、控制器、点云、框、标线、分割
     loaders/index.js              # 格式分发与解析
@@ -175,6 +213,8 @@ src/
   utils/
     http.js                       # axios 封装：baseURL/token/解包/错误归一化/二进制下载
     save.js                       # 保存载荷组装与提交后端
+    draftDb.js                    # 草稿 IndexedDB 读写与标签压缩/还原
+    zip.js                        # 无依赖 ZIP 打包（store 模式）
     polyline.js                   # 折线/箭头模板几何（前端与测试数据生成共用）
     diff.js                       # 帧对象快照 / 签名 / 提交 diff
     projection.js                 # 3D→2D 相机投影（2D 面板与合成图像共用）
@@ -183,10 +223,14 @@ src/
     actions.js io.js kitti.js math.js id.js
   components/                     # Toolbar / ObjectList / Properties / ClassManager
                                   # SegmentPanel / CommentPanel / LoginDialog
-                                  # Viewer / Timeline / StatusBar
+                                  # Viewer / Timeline / StatusBar / RightPanel
                                   # ReviewWorkbench / SuggestionPanel / QualityPanel
                                   # VersionPanel / ImagePanel / DemoTour
-scripts/                          # 测试数据/合成图像生成与下载
+                                  # TrackPanel / ShortcutsDialog
+scripts/                          # 测试数据/合成图像生成、下载、冒烟测试
+eslint.config.js                  # ESLint flat config
+vitest.config.js                  # Vitest
+.github/workflows/ci.yml          # lint + test + build
 .env.example                      # 后端地址等配置模板
 ```
 
@@ -198,6 +242,7 @@ scripts/                          # 测试数据/合成图像生成与下载
 VITE_API_BASE=            # 可选，API 基地址（留空=同源）
 VITE_API_TIMEOUT=30000    # 可选，请求超时(ms)
 VITE_SAVE_API=https://your-server/api/annotations   # 保存接口(POST JSON)；留空则「保存」退化为下载
+VITE_PREDICT_API=https://your-server/api/predict    # 可选，AI 预标注接口；留空使用内置 mock
 ```
 
 点击工具栏「保存」时会 `POST` 如下载荷到 `VITE_SAVE_API`：
@@ -225,8 +270,7 @@ VITE_SAVE_API=https://your-server/api/annotations   # 保存接口(POST JSON)；
                     [[0.45,0,-1.68], [1.3,0.1,-1.68], [1.95,0.65,-1.68], [2.15,1.35,-1.68]]],
           "trackId": 0, "source": "manual" }
       ],
-      "pointLabels": { "pointCount": 395503, "labeled": 176307,
-                       "labels": [-1, -1, 0, "..."],
+      "pointLabels": { "version": 2, "encoding": "segments", "pointCount": 395503, "labeled": 176307,
                        "segments": [{ "classId": 0, "indices": [12, 13, "..."] }] }
     }
   ],
@@ -264,6 +308,49 @@ VITE_SAVE_API=https://your-server/api/annotations   # 保存接口(POST JSON)；
 HTTP 层封装在 `src/utils/http.js`（axios）：请求前缀、超时、token 注入（`setAuthToken`）、
 响应解包、错误归一化（超时/网络/HTTP 状态/业务码）、`downloadBinary()` 二进制下载（点云文件走这里）、
 `withLoading()` loading 包裹，以及 `{ silent: true }` 关闭自动错误提示。
+
+### AI 预标注接口
+
+配置 `VITE_PREDICT_API` 后，点击「AI 建议」会 `POST` 当前帧信息：
+
+```json
+{
+  "dataset": "urban",
+  "frameIndex": 12,
+  "frameName": "frame_000012.bin",
+  "pointCount": 395503,
+  "classes": [{ "id": 0, "name": "Car", "color": "#4f9bff" }],
+  "objects": [{ "id": "obj_1", "type": "Car", "trackId": 1001, "x": 8, "y": -2.6, "z": -0.98, "ry": 0 }]
+}
+```
+
+响应可以是数组，或 `{ "suggestions": [...] }` / `{ "items": [...] }`。每条建议：
+
+```json
+{
+  "kind": "add",
+  "score": 0.92,
+  "object": { "type": "Car", "classId": 0, "h": 1.5, "w": 1.8, "l": 4.2, "x": 8, "y": -2.6, "z": -0.98, "ry": 0 }
+}
+```
+
+`kind=refine` 时需要额外的 `targetId`（当前帧已有对象 id）。接口失败或未配置时自动回退到演示 mock。
+
+### 点级标签格式（v2）
+
+保存/导出时 `pointLabels` 不再包含逐点 `labels` 数组，只保留稀疏 `segments`：
+
+```json
+{
+  "version": 2,
+  "encoding": "segments",
+  "pointCount": 395503,
+  "labeled": 176307,
+  "segments": [{ "classId": 6, "indices": [12, 13, 14] }]
+}
+```
+
+需要逐点数组时可调用 `viewer.exportCurrentLabels({ includeLabels: true })`。本地草稿的 IndexedDB 记录同样只保存 segments，并额外保存类别表与活跃类别。
 
 ## 标注格式
 

@@ -14,7 +14,6 @@ import { downloadJson } from '../utils/io.js'
 import {
   COMMENT_STATUS,
   REJECT_CATEGORIES,
-  rejectCategoryLabel,
   statusLabelOf,
   statusTypeOf,
 } from '../stores/reviewCore.js'

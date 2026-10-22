@@ -6,14 +6,65 @@ import { createApp } from 'vue'
 import ElementPlus from 'element-plus'
 import 'element-plus/dist/index.css'
 import 'element-plus/theme-chalk/dark/css-vars.css' // 暗色主题变量
-import * as ElementPlusIconsVue from '@element-plus/icons-vue'
+import {
+  Aim,
+  ArrowDown,
+  ArrowLeft,
+  ArrowRight,
+  Close,
+  Connection,
+  CopyDocument,
+  DArrowLeft,
+  DArrowRight,
+  Delete,
+  DocumentCopy,
+  Download,
+  EditPen,
+  Files,
+  MagicStick,
+  MoreFilled,
+  Plus,
+  RefreshLeft,
+  RefreshRight,
+  Setting,
+  Upload,
+  User,
+  VideoPause,
+  VideoPlay,
+} from '@element-plus/icons-vue'
 import './style.css'
 import App from './App.vue'
 
 const app = createApp(App)
 
-// 全局注册所有 Element Plus 图标，模板中可直接用 <Aim /> <Plus /> 等
-for (const [key, component] of Object.entries(ElementPlusIconsVue)) {
+// 只注册模板中实际用到的图标，避免把整套图标打进首屏 bundle
+const icons = {
+  Aim,
+  ArrowDown,
+  ArrowLeft,
+  ArrowRight,
+  Close,
+  Connection,
+  CopyDocument,
+  DArrowLeft,
+  DArrowRight,
+  Delete,
+  DocumentCopy,
+  Download,
+  EditPen,
+  Files,
+  MagicStick,
+  MoreFilled,
+  Plus,
+  RefreshLeft,
+  RefreshRight,
+  Setting,
+  Upload,
+  User,
+  VideoPause,
+  VideoPlay,
+}
+for (const [key, component] of Object.entries(icons)) {
   app.component(key, component)
 }
 

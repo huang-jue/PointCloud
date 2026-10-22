@@ -68,7 +68,7 @@ body {
 }
 
 .panel-right {
-  width: 300px;
+  width: 320px;
   flex: none;
   border-right: none;
   border-left: 1px solid var(--border);
@@ -79,10 +79,24 @@ body {
   min-height: 0;
 }
 
-.panel-body {
-  flex: 1;
-  min-height: 0;
-  overflow-y: auto;
+@media (max-width: 1280px) {
+  .panel-left {
+    width: 236px;
+  }
+
+  .panel-right {
+    width: 300px;
+  }
+}
+
+@media (max-width: 1080px) {
+  .panel-left {
+    width: 210px;
+  }
+
+  .panel-right {
+    width: 276px;
+  }
 }
 
 .section {
@@ -342,6 +356,18 @@ body {
   white-space: nowrap;
 }
 
+@media (max-width: 1500px) {
+  .toolbar-main {
+    gap: 6px;
+    padding-left: 10px;
+    padding-right: 10px;
+  }
+
+  .toolbar .brand-text {
+    display: none;
+  }
+}
+
 .toolbar .spacer {
   flex: 1;
 }
@@ -459,6 +485,19 @@ body {
 
 .list-empty {
   padding: 24px 12px;
+}
+
+.obj-filters {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.obj-more {
+  display: flex;
+  justify-content: center;
+  padding: 8px 0 12px;
 }
 
 /* 分割：选中片段编辑区 */
@@ -626,6 +665,10 @@ body {
 
 .statusbar .mono {
   font-variant-numeric: tabular-nums;
+}
+
+.statusbar .draft-status {
+  color: var(--accent);
 }
 
 .hidden-input {

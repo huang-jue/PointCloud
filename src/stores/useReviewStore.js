@@ -74,6 +74,8 @@ function clearInMemory() {
   reviewState.workflows = {}
   reviewState.comments = []
   reviewState.updatedAt = 0
+  reviewState.storageError = ''
+  reviewState.mergeWarning = ''
   pendingLegacyWorkflow = null
 }
 
@@ -255,12 +257,22 @@ export function saveReview({ merge = true } = {}) {
         comments: reviewState.comments,
       }),
     )
-  } catch {
-    /* 隐私模式/容量不足时忽略 */
+    reviewState.storageError = ''
+  } catch (err) {
+    const quota = err?.name === 'QuotaExceededError' || err?.code === 22
+    reviewState.storageError = quota
+      ? '本地存储空间不足，批注/审核记录未能保存；请导出数据后清理浏览器存储'
+      : `批注/审核记录保存失败：${err?.message || String(err)}`
   }
 }
 
 /* ---------------- 跨标签页同步 ---------------- */
+
+/** 两个标签页对同一帧给出不同的终态（通过/打回）才是需要提示的冲突 */
+function isConflictingStatus(a, b) {
+  const terminal = new Set([STATUS.APPROVED, STATUS.REJECTED])
+  return terminal.has(a) && terminal.has(b) && a !== b
+}
 
 function mergeRemote(parsed) {
   const next = { ...reviewState.workflows }
@@ -276,6 +288,13 @@ function mergeRemote(parsed) {
     for (const [key, workflow] of Object.entries(parsed.workflows)) {
       const local = next[key]
       if (!local || (workflow.updatedAt || 0) > (local.updatedAt || 0)) {
+        if (
+          local &&
+          isConflictingStatus(local.status, workflow.status) &&
+          (workflow.updatedAt || 0) > (local.updatedAt || 0)
+        ) {
+          reviewState.mergeWarning = `检测到其他标签页并发修改第 ${Number(key) + 1} 帧的审核结果，已采用较新的记录`
+        }
         next[key] = workflow
       }
     }

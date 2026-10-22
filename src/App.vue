@@ -9,10 +9,7 @@ import { onMounted, onBeforeUnmount, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import Toolbar from './components/Toolbar.vue'
 import ObjectList from './components/ObjectList.vue'
-import Properties from './components/Properties.vue'
-import ClassManager from './components/ClassManager.vue'
-import SegmentPanel from './components/SegmentPanel.vue'
-import CommentPanel from './components/CommentPanel.vue'
+import RightPanel from './components/RightPanel.vue'
 import ReviewWorkbench from './components/ReviewWorkbench.vue'
 import SuggestionPanel from './components/SuggestionPanel.vue'
 import QualityPanel from './components/QualityPanel.vue'
@@ -23,6 +20,8 @@ import LoginDialog from './components/LoginDialog.vue'
 import Viewer from './components/Viewer.vue'
 import Timeline from './components/Timeline.vue'
 import StatusBar from './components/StatusBar.vue'
+import TrackPanel from './components/TrackPanel.vue'
+import ShortcutsDialog from './components/ShortcutsDialog.vue'
 import {
   state,
   store,
@@ -36,8 +35,9 @@ import {
 } from './stores/useAnnotationStore.js'
 import { viewerRef } from './three/viewerRef.js'
 import { requestRemoveObjects } from './utils/actions.js'
-import { ROLES, authState, canAnnotate, login, openLogin } from './stores/useAuthStore.js'
-import { canEditCurrentFrame } from './stores/useReviewStore.js'
+import { ROLES, authState, login, openLogin } from './stores/useAuthStore.js'
+import { canEditCurrentFrame, reviewState } from './stores/useReviewStore.js'
+import { initDraftAutosave } from './stores/useDraftStore.js'
 
 /** 角色切换或当前帧被锁定后退出绘制/分割，保持只读 */
 watch(canEditCurrentFrame, (allowed) => {
@@ -66,6 +66,42 @@ watch(
   },
 )
 
+/** 本地草稿恢复/失败提示 */
+watch(
+  () => state.draftRestored,
+  (count) => {
+    if (!count) return
+    ElMessage.success(`已恢复 ${count} 帧本地草稿`)
+    state.draftRestored = 0
+  },
+)
+watch(
+  () => state.draftError,
+  (err) => {
+    if (!err) return
+    ElMessage.error(err)
+    state.draftError = ''
+  },
+)
+
+/** 审核记录写入失败/多标签页冲突提示 */
+watch(
+  () => reviewState.storageError,
+  (err) => {
+    if (!err) return
+    ElMessage.error(err)
+    reviewState.storageError = ''
+  },
+)
+watch(
+  () => reviewState.mergeWarning,
+  (message) => {
+    if (!message) return
+    ElMessage.warning(message)
+    reviewState.mergeWarning = ''
+  },
+)
+
 /** 焦点在输入类控件时不触发快捷键，避免误操作 */
 function isTyping(target) {
   const tag = target?.tagName
@@ -77,13 +113,9 @@ function isDrawing() {
   return canEditCurrentFrame.value && (state.tool === 'line' || state.tool === 'arrow')
 }
 
-/** 有手工标注/复制对象或编辑过点标签时，离开页面前提醒（演示环境不自动持久化） */
+/** 有尚未写入本地草稿的编辑时，离开页面前提醒 */
 function hasUnsavedWork() {
-  const manualObject = state.frames.some((f) =>
-    f.objects.some((o) => o.source === 'manual' || o.source === 'copy'),
-  )
-  const editedLabels = (viewerRef.current?.labelsByKey?.size || 0) > 0
-  return manualObject || editedLabels
+  return state.dirty
 }
 
 function onBeforeUnload(event) {
@@ -122,13 +154,31 @@ function onKeydown(event) {
       return
     }
   }
-  // Ctrl/Cmd+Z：撤销上一步点标签
+  // Ctrl/Cmd+Z：撤销（标注编辑优先，分割模式下优先撤销点标签）
   if (mod && (event.key === 'z' || event.key === 'Z')) {
-    if (viewerRef.current?.undoLabel()) {
+    if (event.shiftKey) {
+      const redoCommand = store.redo()
+      if (redoCommand) ElMessage.info(`已重做：${redoCommand.label}`)
+    } else if (state.segEnabled && viewerRef.current?.undoLabel()) {
       store.bumpLabelVersion()
       state.selectedSegment = null
       ElMessage.info('已撤销上一步标签')
+    } else {
+      const undoCommand = store.undo()
+      if (undoCommand) {
+        ElMessage.info(`已撤销：${undoCommand.label}`)
+      } else if (viewerRef.current?.undoLabel()) {
+        store.bumpLabelVersion()
+        state.selectedSegment = null
+        ElMessage.info('已撤销上一步标签')
+      }
     }
+    event.preventDefault()
+    return
+  }
+  if (mod && (event.key === 'y' || event.key === 'Y')) {
+    const redoCommand = store.redo()
+    if (redoCommand) ElMessage.info(`已重做：${redoCommand.label}`)
     event.preventDefault()
     return
   }
@@ -223,6 +273,7 @@ function onKeydown(event) {
 onMounted(() => {
   window.addEventListener('keydown', onKeydown)
   window.addEventListener('beforeunload', onBeforeUnload)
+  initDraftAutosave()
   const params = new URLSearchParams(location.search)
   const urlUser = params.get('user')
   const urlRole = params.get('role')
@@ -259,17 +310,7 @@ onBeforeUnmount(() => {
     <div class="app-body">
       <ObjectList />
       <Viewer />
-      <!-- 右侧面板：批注审核 + 标注编辑（批注员只显示批注） -->
-      <aside class="panel panel-right">
-        <div class="panel-body">
-          <CommentPanel />
-          <template v-if="canAnnotate">
-            <Properties />
-            <ClassManager />
-            <SegmentPanel />
-          </template>
-        </div>
-      </aside>
+      <RightPanel />
     </div>
     <Timeline />
     <StatusBar />
@@ -279,6 +320,8 @@ onBeforeUnmount(() => {
     <VersionPanel />
     <ImagePanel />
     <DemoTour />
+    <TrackPanel />
+    <ShortcutsDialog />
     <LoginDialog />
   </div>
 </template>

@@ -7,6 +7,16 @@ import { computed } from 'vue'
 import { state, currentFrame, currentObjects } from '../stores/useAnnotationStore.js'
 import { reviewSummary, statusLabel, statusType } from '../stores/useReviewStore.js'
 
+/** 草稿状态文案 */
+const draftText = computed(() => {
+  if (state.draftSaving) return '草稿保存中…'
+  if (state.dirty) return '草稿未保存'
+  if (state.draftSavedAt) {
+    return `草稿已保存 ${new Date(state.draftSavedAt).toLocaleTimeString('zh-CN', { hour12: false })}`
+  }
+  return ''
+})
+
 /** 所有帧点数之和（部分帧未加载则只统计已加载的） */
 const totalPoints = computed(() => {
   let total = 0
@@ -31,6 +41,7 @@ const coordText = computed(
   <div class="statusbar">
     <el-tag size="small" effect="dark" type="info">{{ state.datasetName || '未加载' }}</el-tag>
     <el-tag v-if="currentFrame" size="small" :type="statusType" effect="plain">{{ statusLabel }}</el-tag>
+    <span v-if="draftText" class="mono draft-status">{{ draftText }}</span>
     <span v-if="reviewSummary.total" class="mono">
       审核 通过 {{ reviewSummary.approved }} · 待审 {{ reviewSummary.submitted }} · 打回
       {{ reviewSummary.rejected }}

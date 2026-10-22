@@ -21,7 +21,9 @@ import {
 } from '../stores/useAnnotationStore.js'
 import { viewerRef } from '../three/viewerRef.js'
 import { ACCEPT } from '../three/loaders/index.js'
-import { downloadJson, downloadText, pickFile } from '../utils/io.js'
+import { downloadBlob, downloadJson, downloadText, pickFile } from '../utils/io.js'
+import { objectsToKittiText } from '../utils/kitti.js'
+import { createZip } from '../utils/zip.js'
 import { requestRemoveObjects } from '../utils/actions.js'
 import { buildSavePayload, summarizePayload, saveToServer, isSaveConfigured } from '../utils/save.js'
 import {
@@ -34,6 +36,7 @@ import {
 import { withLoading } from '../utils/http.js'
 import { authState, currentRole, openLogin, logout, roleLabel } from '../stores/useAuthStore.js'
 import { uiState } from '../stores/useUiStore.js'
+import { clearDatasetDrafts, flushDrafts } from '../stores/useDraftStore.js'
 
 const fileInput = ref(null)
 const datasets = ref([]) // 示例数据集列表（来自 index.json）
@@ -72,6 +75,8 @@ const ARROW_TEMPLATES = [
 const isDrawing = computed(() => state.tool === 'line' || state.tool === 'arrow')
 const drawingLabel = computed(() => (state.tool === 'arrow' ? '画箭头' : '画线'))
 const multiActive = computed(() => state.multiFrame || state.multiFrameMove)
+const canUndo = computed(() => store.historyState.undo.length > 0)
+const canRedo = computed(() => store.historyState.redo.length > 0)
 
 /** 标线类别名（用于「添加框」时自动避开） */
 const MARKING_CLASS_NAMES = ['LaneLine', 'Crosswalk', 'RoadArrow', 'StopLine']
@@ -121,6 +126,7 @@ onMounted(async () => {
 async function loadDataset(id) {
   if (!id) return
   try {
+    await flushDrafts()
     const scene = await store.loadSampleDataset(id)
     ElMessage.success(`已加载「${scene.name}」${scene.frames.length} 帧`)
   } catch (err) {
@@ -180,6 +186,18 @@ function onMoreCommand(command) {
     case 'versions':
       uiState.versionsOpen = true
       break
+    case 'tracks':
+      uiState.tracksOpen = true
+      break
+    case 'shortcuts':
+      uiState.shortcutsOpen = true
+      break
+    case 'export-zip':
+      exportDatasetZip()
+      break
+    case 'clear-drafts':
+      clearDraftsPrompt()
+      break
     default:
       break
   }
@@ -188,7 +206,11 @@ function onMoreCommand(command) {
 /** 本地文件选择回调（支持多选，每个文件一帧） */
 function onFiles(event) {
   const files = Array.from(event.target.files || [])
-  if (files.length) store.loadLocalFiles(files)
+  if (files.length) {
+    flushDrafts()
+      .catch(() => {})
+      .finally(() => store.loadLocalFiles(files))
+  }
   event.target.value = '' // 允许重复选择同一文件
 }
 
@@ -303,6 +325,9 @@ async function importProject() {
       const reset = resetFramesAfterImport(matched, '导入标注')
       if (reset) ElMessage.info(`已重置 ${reset} 个已提交/已通过帧的审核状态`)
     }
+    // 导入结果覆盖旧数据：清掉旧草稿并写入新的当前状态
+    await clearDatasetDrafts()
+    store.markAllFramesDirty()
     ElMessage.success(data.review ? '标注与批注已导入' : '标注已导入')
   } catch (err) {
     ElMessage.error(`导入失败: ${err.message}`)
@@ -338,6 +363,9 @@ async function importGroundTruth() {
       state.frames.map((_, index) => index),
       '重新导入真值',
     )
+    // 重新导入真值会覆盖草稿；清掉旧草稿并把新状态写回，避免下次刷新被旧草稿覆盖
+    await clearDatasetDrafts()
+    store.markAllFramesDirty()
     ElMessage.success(
       `已重新导入全量真值 ${count.toLocaleString()} 个对象${reset ? `，重置 ${reset} 帧审核状态` : ''}`,
     )
@@ -373,6 +401,99 @@ async function resetAllReview() {
   resetReview()
   ElMessage.success('批注与审核记录已重置')
 }
+
+/** 撤销/重做标注编辑（点标签在分割模式下仍走 viewer.undoLabel） */
+function undoEdit() {
+  const command = store.undo()
+  if (command) ElMessage.info(`已撤销：${command.label}`)
+  else ElMessage.info('没有可撤销的标注编辑')
+}
+
+function redoEdit() {
+  const command = store.redo()
+  if (command) ElMessage.info(`已重做：${command.label}`)
+  else ElMessage.info('没有可重做的标注编辑')
+}
+
+/** 常用视角 */
+function setViewPreset(preset) {
+  viewerRef.current?.setViewPreset(preset)
+}
+
+/** 导出整个数据集为 ZIP：项目 JSON + 逐帧 KITTI + 已编辑点标签 */
+function exportDatasetZip() {
+  if (!state.frames.length) return
+  const dataset = state.datasetName || 'dataset'
+  const files = []
+  const project = store.serializeProject()
+  project.review = serializeReview()
+  files.push({ name: 'annotations.json', data: JSON.stringify(project, null, 2) })
+
+  const viewer = viewerRef.current
+  let kittiFrames = 0
+  let labelFrames = 0
+  let skippedMarkings = 0
+  for (const frame of state.frames) {
+    const base = frame.name.replace(/\.[^.]+$/, '')
+    const boxes = frame.objects.filter((o) => o.shape !== 'line' && o.shape !== 'arrow')
+    skippedMarkings += frame.objects.length - boxes.length
+    if (boxes.length) {
+      files.push({ name: `labels/${base}.txt`, data: objectsToKittiText(boxes) })
+      kittiFrames++
+    }
+    if (viewer) {
+      const labels = viewer.serializeLabels(viewer.cacheKeyFor(frame))
+      if (labels) {
+        files.push({
+          name: `point_labels/${base}.json`,
+          data: JSON.stringify({
+            format: 'pointcloud-labels',
+            frame: frame.name,
+            classes: state.classes,
+            ...labels,
+          }),
+        })
+        labelFrames++
+      }
+    }
+  }
+
+  files.push({
+    name: 'README.txt',
+    data: [
+      `dataset: ${dataset}`,
+      `exportedAt: ${new Date().toISOString()}`,
+      `frames: ${state.frames.length}`,
+      `kittiFrames: ${kittiFrames}`,
+      `pointLabelFrames: ${labelFrames}`,
+      skippedMarkings ? `注意: KITTI 不支持标线，已跳过 ${skippedMarkings} 个标线对象` : '',
+      'annotations.json 保留完整框/标线与批注审核记录',
+    ]
+      .filter(Boolean)
+      .join('\n'),
+  })
+
+  downloadBlob(`${dataset}-export.zip`, createZip(files))
+  ElMessage.success(
+    `已导出 ZIP：${kittiFrames} 帧 KITTI / ${labelFrames} 帧点标签${skippedMarkings ? `（跳过 ${skippedMarkings} 个标线）` : ''}`,
+  )
+}
+
+/** 清除当前数据集的本地草稿 */
+async function clearDraftsPrompt() {
+  if (!state.datasetName) return
+  try {
+    await ElMessageBox.confirm(
+      '将删除当前数据集保存在浏览器中的自动草稿（不影响当前页面里的标注）。确定？',
+      '清除本地草稿',
+      { type: 'warning', confirmButtonText: '清除', cancelButtonText: '取消' },
+    )
+  } catch {
+    return
+  }
+  const count = await clearDatasetDrafts()
+  ElMessage.success(count ? `已清除 ${count} 帧本地草稿` : '没有本地草稿')
+}
 </script>
 
 <template>
@@ -380,7 +501,7 @@ async function resetAllReview() {
     <div class="toolbar-main">
       <span class="brand">
         <el-icon><Aim /></el-icon>
-        点云标注
+        <span class="brand-text">点云标注</span>
       </span>
 
       <el-dropdown trigger="click" @command="onDataCommand">
@@ -453,6 +574,15 @@ async function resetAllReview() {
           @click="deleteSelected"
         >
           <el-icon><Delete /></el-icon>
+        </el-button>
+      </el-button-group>
+
+      <el-button-group class="history-actions">
+        <el-button :disabled="!canUndo" title="撤销 (Ctrl+Z)" aria-label="撤销" @click="undoEdit">
+          <el-icon><RefreshLeft /></el-icon>
+        </el-button>
+        <el-button :disabled="!canRedo" title="重做 (Ctrl+Shift+Z)" aria-label="重做" @click="redoEdit">
+          <el-icon><RefreshRight /></el-icon>
         </el-button>
       </el-button-group>
 
@@ -531,6 +661,15 @@ async function resetAllReview() {
             />
           </div>
           <div class="popover-field">
+            <span class="popover-label">视角</span>
+            <el-button-group style="width: 100%">
+              <el-button size="small" @click="setViewPreset('top')">俯视</el-button>
+              <el-button size="small" @click="setViewPreset('front')">前视</el-button>
+              <el-button size="small" @click="setViewPreset('side')">侧视</el-button>
+              <el-button size="small" @click="setViewPreset('iso')">等轴</el-button>
+            </el-button-group>
+          </div>
+          <div class="popover-field">
             <el-button size="small" style="width: 100%" @click="uiState.imageOpen = true">
               2D 图像联动
             </el-button>
@@ -567,6 +706,14 @@ async function resetAllReview() {
             </el-dropdown-item>
             <el-dropdown-item command="quality">质量检查</el-dropdown-item>
             <el-dropdown-item command="versions" :disabled="!state.frames.length">版本快照</el-dropdown-item>
+            <el-dropdown-item command="tracks" :disabled="!state.frames.length">轨迹管理与搜索</el-dropdown-item>
+            <el-dropdown-item command="export-zip" :disabled="!state.frames.length">
+              导出数据集 ZIP（KITTI+点标签）
+            </el-dropdown-item>
+            <el-dropdown-item command="shortcuts">快捷键说明</el-dropdown-item>
+            <el-dropdown-item command="clear-drafts" :disabled="!state.frames.length">
+              清除本地草稿
+            </el-dropdown-item>
             <el-dropdown-item command="tour">演示引导</el-dropdown-item>
             <el-dropdown-item
               v-if="currentRole === 'admin'"
@@ -583,9 +730,15 @@ async function resetAllReview() {
         placement="bottom"
         content="导出所有帧的框/标线、已编辑点标签与批注/审核记录为 JSON"
       >
-        <el-button type="primary" :loading="saving" :disabled="!state.frames.length" @click="save">
+        <el-button
+          type="primary"
+          :loading="saving"
+          :disabled="!state.frames.length"
+          title="导出标注与批注"
+          aria-label="导出"
+          @click="save"
+        >
           <el-icon><Download /></el-icon>
-          <span>导出</span>
         </el-button>
       </el-tooltip>
     </div>
